@@ -5,8 +5,6 @@ RuntimeOS is a runtime governance control plane for AI agents. This competition 
 ## Google AI Builder Cup build
 Team Guardrail Architects: Adilakshmi V and Divya D (Solution Architects, Capgemini). Theme: BFSI, Intelligent Risk, Fraud & Financial Experiences.
 
-Credits: the RuntimeOS core (governance engine, console, SDKs) was created by Praneeth Mangala ([c0ntr1butr/Snowflake_RuntimeOS](https://github.com/c0ntr1butr/Snowflake_RuntimeOS)) and is used with his permission. The Google AI Builder Cup work (Gemini, Firestore, Firebase Hosting, Cloud Run deploy) was added by the team.
-
 | Google service | How RuntimeOS uses it |
 |---|---|
 | Gemini (Vertex AI, `gemini-2.5-flash`) | `backend/google_ai.py` turns transaction and regulatory evidence into grounded analyst answers |
