@@ -1,0 +1,101 @@
+services:
+  - type: web
+    name: runtimeos-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: MONGO_URL
+        sync: false
+      - key: DB_NAME
+        value: runtimeos
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_ORG_NAME
+        value: RuntimeOS Cloud
+      - key: ENVIRONMENT
+        value: production
+      - key: ALLOWED_ORIGINS
+        value: https://runtimeos-web.onrender.com
+      - key: DODO_PAYMENTS_API_KEY
+        sync: false
+      - key: DODO_PAYMENTS_ENVIRONMENT
+        value: live_mode
+      - key: DODO_GROWTH_MONTHLY_PRODUCT_ID
+        sync: false
+      - key: DODO_GROWTH_ANNUAL_PRODUCT_ID
+        sync: false
+      - key: DODO_PAYMENTS_WEBHOOK_KEY
+        sync: false
+      - key: BREETH_API_KEY
+        sync: false
+      - key: BREETH_BASE_URL
+        value: https://api.thebreeth.com/v1
+      - key: N8N_WEBHOOK_URL
+        sync: false
+      - key: SNOWFLAKE_ACCOUNT
+        sync: false
+      - key: SNOWFLAKE_USER
+        sync: false
+      - key: SNOWFLAKE_PASSWORD
+        sync: false
+      - key: SNOWFLAKE_ROLE
+        sync: false
+      - key: SNOWFLAKE_WAREHOUSE
+        sync: false
+      - key: SNOWFLAKE_DATABASE
+        value: RUNTIMEOS_HACK
+      - key: SNOWFLAKE_SCHEMA
+        value: RISK
+      - key: SNOWFLAKE_CORTEX_MODEL
+        value: llama3.3-70b
+
+  - type: web
+    name: runtimeos-web
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install --legacy-peer-deps && npm run build
+    staticPublishPath: build
+    envVars:
+      - key: REACT_APP_BACKEND_URL
+        value: https://runtimeos-api.onrender.com
+
+# Add N8N_WEBHOOK_URL and SNOWFLAKE_* variables in the Render dashboard for live integrations.
+
+  - type: web
+    name: runtimeos-risk-copilot
+    runtime: python
+    rootDir: snowflake
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run streamlit/app.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: RUNTIMEOS_URL
+        value: https://runtimeos-api.onrender.com
+      - key: SNOWFLAKE_ACCOUNT
+        sync: false
+      - key: SNOWFLAKE_USER
+        sync: false
+      - key: SNOWFLAKE_PASSWORD
+        sync: false
+      - key: SNOWFLAKE_ROLE
+        sync: false
+      - key: SNOWFLAKE_WAREHOUSE
+        sync: false
+      - key: SNOWFLAKE_DATABASE
+        value: RUNTIMEOS_HACK
+      - key: SNOWFLAKE_SCHEMA
+        value: RISK
+      - key: SNOWFLAKE_CORTEX_MODEL
+        value: llama3.3-70b

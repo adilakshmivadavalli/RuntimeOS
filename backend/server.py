@@ -1,0 +1,2326 @@
+"""AI Runtime Governance backend."""
+from dotenv import load_dotenv
+load_dotenv()
+
+import os
+import re
+import json
+import time
+import uuid
+import jwt
+import bcrypt
+import random
+import asyncio
+import hashlib
+import hmac
+import secrets
+import logging
+import httpx
+from collections import deque
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Dict, Any, Literal, Set
+from fastapi import (FastAPI, APIRouter, Request, Response, HTTPException,
+                     Depends, Query, WebSocket, WebSocketDisconnect, status)
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field, EmailStr
+import firestore_store
+
+try:
+    from risk_copilot import (
+        risk_summary as copilot_risk_summary,
+        list_transactions as copilot_list_transactions,
+        transaction_detail as copilot_transaction_detail,
+        copilot_query as copilot_nl_query,
+        governed_action as copilot_governed_action,
+        audit_report as copilot_audit_report,
+    )
+except Exception as exc:  # pragma: no cover - fail soft for existing runtime
+    copilot_risk_summary = copilot_list_transactions = copilot_transaction_detail = None
+    copilot_nl_query = copilot_governed_action = copilot_audit_report = None
+    logger_bootstrap_error = exc
+
+# ------------------------ setup ------------------------
+mongo_url = os.environ["MONGO_URL"]
+db_name = os.environ["DB_NAME"]
+client = AsyncIOMotorClient(mongo_url)
+db = client[db_name]
+
+JWT_SECRET = os.environ["JWT_SECRET"]
+JWT_ALGO = "HS256"
+
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "development").lower()
+IS_DEV = ENVIRONMENT == "development"
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "").strip()
+ALLOWED_ORIGINS: List[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+# Wildcard suffixes (e.g. ".preview.example.com") allow any subdomain.
+_raw_suffixes = os.environ.get("ALLOWED_ORIGIN_SUFFIXES", "").strip()
+ALLOWED_ORIGIN_SUFFIXES: List[str] = [s.strip() for s in _raw_suffixes.split(",") if s.strip()]
+
+
+def _origin_allowed(origin: str) -> bool:
+    if origin in ALLOWED_ORIGINS:
+        return True
+    for suffix in ALLOWED_ORIGIN_SUFFIXES:
+        if origin.endswith(suffix):
+            return True
+    return False
+
+
+# Build a CORS regex that matches explicit origins + suffix wildcards.
+def _cors_regex() -> Optional[str]:
+    parts = [re.escape(o) for o in ALLOWED_ORIGINS]
+    for s in ALLOWED_ORIGIN_SUFFIXES:
+        parts.append(r"https?://[^/]+" + re.escape(s))
+    if not parts:
+        return None
+    return "^(" + "|".join(parts) + ")$"
+
+app = FastAPI(
+    title="RuntimeOS Runtime Governance API",
+    version="0.2.0",
+    description=(
+        "Zero-trust runtime infrastructure for autonomous AI agents.\n\n"
+        "Every autonomous action from your agents is evaluated against **identity, policy,\n"
+        "context, and risk** — and returned as one of `allow` / `block` / `modify` /\n"
+        "`escalate`.\n\n"
+        "This is the same API served at `https://api.memorygate.dev` and consumed by the\n"
+        "`memorygate` Python SDK and `@memorygate/sdk` TypeScript SDK.\n\n"
+        "- **Auth**: JWT via `POST /api/auth/login` — send `Authorization: Bearer <token>` or\n"
+        "  rely on the `access_token` httpOnly cookie set by the login response.\n"
+        "- **Rate limits**: per-IP sliding window. `/api/evaluate` is the hot path (6000/min).\n"
+        "- **Public playground**: `/api/public/evaluate` needs no auth and hits a shared\n"
+        "  demo tenant. Rate-limited to 15 req/min per IP.\n"
+    ),
+    openapi_tags=[
+        {"name": "auth",       "description": "Register, login, current-user."},
+        {"name": "evaluate",   "description": "The hot path — evaluate one agent action."},
+        {"name": "public",     "description": "No-auth playground endpoints. Aggressively rate-limited."},
+        {"name": "agents",     "description": "Register and manage the AI agents that call `/evaluate`."},
+        {"name": "policies",   "description": "Ordered rules that decide the effect of an action. Versioned."},
+        {"name": "decisions",  "description": "Historical decisions and audit log."},
+        {"name": "escalations","description": "Human-in-the-loop queue."},
+        {"name": "analytics",  "description": "KPIs, timeline, mix, risk heatmap."},
+        {"name": "compliance", "description": "SOC 2 / ISO 27001 / GDPR / HIPAA reports and CSV export."},
+        {"name": "api-keys",   "description": "Programmatic credentials for SDK / server integrations."},
+        {"name": "webhooks",   "description": "Push decisions to Slack / Teams / PagerDuty / custom."},
+        {"name": "connectors", "description": "Postgres / Mongo / SurrealDB / Redis / Pinecone / Qdrant / REST."},
+        {"name": "members",    "description": "Multi-tenant org membership and RBAC."},
+    ],
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+)
+api = APIRouter(prefix="/api")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("governance")
+
+# Structured audit logger — one JSON line per event, dedicated stream.
+audit_logger = logging.getLogger("audit")
+if not audit_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(message)s"))
+    audit_logger.addHandler(_h)
+audit_logger.setLevel(logging.INFO)
+audit_logger.propagate = False
+
+
+def audit_log(event: str, **fields: Any) -> None:
+    """Emit one structured JSON line for audit consumers (SIEM/ELK)."""
+    payload = {"ts": now_utc().isoformat(), "event": event, "env": ENVIRONMENT, **fields}
+    try:
+        audit_logger.info(json.dumps(payload, default=str, separators=(",", ":")))
+    except Exception:
+        # audit logging must never break request handling
+        logger.exception("audit_log serialization failed")
+
+
+# ------------------------ helpers ------------------------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def new_id() -> str:
+    return str(uuid.uuid4())
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def create_access_token(user_id: str, email: str, org_id: str) -> str:
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "org_id": org_id,
+        "type": "access",
+        "exp": now_utc() + timedelta(hours=8),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+
+def set_auth_cookie(response: Response, token: str):
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        max_age=8 * 3600,
+        path="/",
+    )
+
+
+def clear_auth_cookie(response: Response):
+    response.delete_cookie("access_token", path="/")
+
+
+async def get_current_user(request: Request) -> dict:
+    """Resolve the current user for a request.
+
+    The product no longer requires signing in: with no token present this
+    transparently resolves to the single seeded demo user (see _seed_demo),
+    so every one of the ~40 endpoints below that depend on this function
+    keep working unchanged — they still receive a real user dict with a
+    real org_id and role, just without anyone having typed a password.
+    A valid token, if one is still presented, is honored exactly as before.
+    """
+    token = request.cookies.get("access_token")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+    if not token:
+        return await _demo_user()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+async def _demo_user() -> dict:
+    admin_email = os.environ.get("ADMIN_EMAIL", "admin@sentinel.ai").lower()
+    user = await db.users.find_one({"email": admin_email}, {"_id": 0, "password_hash": 0})
+    if not user:
+        # Should only happen if a request lands before startup's _seed_demo
+        # has run. Fail closed rather than silently making one up.
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
+
+# ---------- role helpers ----------
+_ROLE_ORDER = ["viewer", "editor", "admin", "owner"]
+
+
+def _has_role(user: dict, minimum: str) -> bool:
+    try:
+        return _ROLE_ORDER.index(user.get("role", "viewer")) >= _ROLE_ORDER.index(minimum)
+    except ValueError:
+        return False
+
+
+def require_role(minimum: str):
+    async def _dep(user=Depends(get_current_user)):
+        if not _has_role(user, minimum):
+            raise HTTPException(403, f"Requires role: {minimum} or higher")
+        return user
+    return _dep
+
+
+# ------------------------ models ------------------------
+_NAME_RE = r"^[A-Za-z0-9 _.\-]{1,80}$"
+_PATTERN_RE = r"^[A-Za-z0-9_.\-\*]{1,120}$"
+
+
+class RegisterIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    name: str = Field(min_length=1, max_length=80)
+    org_name: str = Field(min_length=1, max_length=80)
+
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=1, max_length=128)
+
+
+class AgentIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80, pattern=_NAME_RE)
+    description: Optional[str] = Field(default="", max_length=500)
+    framework: str = Field(default="custom", max_length=40)
+    capabilities: List[str] = Field(default_factory=list, max_length=32)
+    trust_level: Literal["low", "medium", "high"] = "medium"
+    status: Literal["active", "paused", "revoked"] = "active"
+
+
+class PolicyCondition(BaseModel):
+    field: str = Field(max_length=40)
+    op: Literal["equals", "not_equals", "contains", "gt", "lt", "in", "not_in"]
+    value: Any
+
+
+class PolicyIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120, pattern=_NAME_RE)
+    description: Optional[str] = Field(default="", max_length=500)
+    priority: int = Field(default=100, ge=0, le=10000)
+    subject: str = Field(default="*", max_length=64)
+    resource_pattern: str = Field(default="*", max_length=120, pattern=_PATTERN_RE)
+    action: str = Field(default="*", max_length=40)
+    conditions: List[PolicyCondition] = Field(default_factory=list, max_length=32)
+    effect: Literal["allow", "block", "modify", "escalate"] = "allow"
+    modify_instructions: Optional[str] = Field(default=None, max_length=500)
+    enabled: bool = True
+
+
+class EvaluateIn(BaseModel):
+    agent_id: str = Field(min_length=1, max_length=64)
+    resource: str = Field(min_length=1, max_length=200)
+    action: str = Field(default="read", max_length=40)
+    purpose: Optional[str] = Field(default="", max_length=500)
+    context: Dict[str, Any] = Field(default_factory=dict)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EscalationDecisionIn(BaseModel):
+    approve: bool
+    note: Optional[str] = Field(default="", max_length=500)
+
+
+# ------------------------ auth ------------------------
+@api.post("/auth/register", tags=["auth"], summary="Create a new organization and its first user")
+async def register(body: RegisterIn, request: Request, response: Response):
+    email = body.email.lower()
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        audit_log("auth.register.rejected", email=email, ip=_client_ip(request), reason="duplicate")
+        raise HTTPException(status_code=400, detail="Email already registered")
+    org_id = new_id()
+    user_id = new_id()
+    await db.orgs.insert_one({
+        "id": org_id,
+        "name": body.org_name,
+        "owner_user_id": user_id,
+        "api_key": "sk_gov_" + uuid.uuid4().hex,
+        "created_at": now_utc().isoformat(),
+    })
+    user_doc = {
+        "id": user_id,
+        "org_id": org_id,
+        "email": email,
+        "name": body.name,
+        "role": "owner",
+        "password_hash": hash_password(body.password),
+        "created_at": now_utc().isoformat(),
+    }
+    await db.users.insert_one(user_doc)
+    token = create_access_token(user_id, email, org_id)
+    set_auth_cookie(response, token)
+    audit_log("auth.register", user_id=user_id, org_id=org_id, email=email, ip=_client_ip(request))
+    user_doc.pop("password_hash", None)
+    user_doc.pop("_id", None)
+    return {"user": user_doc, "token": token}
+
+
+@api.post("/auth/login", tags=["auth"], summary="Exchange email+password for an access token")
+async def login(body: LoginIn, request: Request, response: Response):
+    email = body.email.lower()
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(body.password, user["password_hash"]):
+        audit_log("auth.login.failed", email=email, ip=_client_ip(request))
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = create_access_token(user["id"], user["email"], user["org_id"])
+    set_auth_cookie(response, token)
+    audit_log("auth.login", user_id=user["id"], org_id=user["org_id"], email=email, ip=_client_ip(request))
+    user.pop("_id", None)
+    user.pop("password_hash", None)
+    return {"user": user, "token": token}
+
+
+@api.post("/auth/logout")
+async def logout(request: Request, response: Response):
+    clear_auth_cookie(response)
+    audit_log("auth.logout", ip=_client_ip(request))
+    return {"ok": True}
+
+
+@api.get("/auth/me")
+async def me(user=Depends(get_current_user)):
+    return {"user": user}
+
+
+# ------------------------ agents ------------------------
+def sanitize(doc: dict) -> dict:
+    doc.pop("_id", None)
+    return doc
+
+
+@api.get("/agents")
+async def list_agents(user=Depends(get_current_user)):
+    items = await db.agents.find({"org_id": user["org_id"]}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return items
+
+
+@api.post("/agents")
+async def create_agent(body: AgentIn, user=Depends(require_role("editor"))):
+    doc = body.model_dump()
+    doc.update({
+        "id": new_id(),
+        "org_id": user["org_id"],
+        "created_at": now_utc().isoformat(),
+        "risk_score": {"low": 15, "medium": 45, "high": 75}[body.trust_level],
+        "decisions_count": 0,
+    })
+    await db.agents.insert_one(doc)
+    return sanitize(doc)
+
+
+@api.get("/agents/{agent_id}")
+async def get_agent(agent_id: str, user=Depends(get_current_user)):
+    doc = await db.agents.find_one({"id": agent_id, "org_id": user["org_id"]}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Agent not found")
+    return doc
+
+
+@api.patch("/agents/{agent_id}")
+async def update_agent(agent_id: str, body: AgentIn, user=Depends(require_role("editor"))):
+    update = body.model_dump()
+    r = await db.agents.update_one(
+        {"id": agent_id, "org_id": user["org_id"]}, {"$set": update}
+    )
+    if not r.matched_count:
+        raise HTTPException(404, "Agent not found")
+    doc = await db.agents.find_one({"id": agent_id}, {"_id": 0})
+    return doc
+
+
+@api.delete("/agents/{agent_id}")
+async def delete_agent(agent_id: str, user=Depends(require_role("editor"))):
+    r = await db.agents.delete_one({"id": agent_id, "org_id": user["org_id"]})
+    if not r.deleted_count:
+        raise HTTPException(404, "Agent not found")
+    return {"ok": True}
+
+
+# ------------------------ policies ------------------------
+@api.get("/policies")
+async def list_policies(user=Depends(get_current_user)):
+    items = await db.policies.find({"org_id": user["org_id"]}, {"_id": 0}).sort("priority", 1).to_list(500)
+    return items
+
+
+@api.post("/policies")
+async def create_policy(body: PolicyIn, user=Depends(require_role("editor"))):
+    doc = body.model_dump()
+    doc.update({
+        "id": new_id(),
+        "org_id": user["org_id"],
+        "created_at": now_utc().isoformat(),
+        "hits": 0,
+    })
+    await db.policies.insert_one(doc)
+    return sanitize(doc)
+
+
+@api.patch("/policies/{policy_id}")
+async def update_policy(policy_id: str, body: PolicyIn, user=Depends(require_role("editor"))):
+    existing = await db.policies.find_one({"id": policy_id, "org_id": user["org_id"]}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Policy not found")
+    # Snapshot the previous version so we can roll back.
+    version_num = existing.get("version", 1)
+    await db.policy_versions.insert_one({
+        "id": new_id(),
+        "policy_id": policy_id,
+        "org_id": user["org_id"],
+        "version": version_num,
+        "snapshot": existing,
+        "changed_by": user["email"],
+        "created_at": now_utc().isoformat(),
+    })
+    update = body.model_dump()
+    update["version"] = version_num + 1
+    await db.policies.update_one(
+        {"id": policy_id, "org_id": user["org_id"]}, {"$set": update}
+    )
+    return await db.policies.find_one({"id": policy_id}, {"_id": 0})
+
+
+@api.delete("/policies/{policy_id}")
+async def delete_policy(policy_id: str, user=Depends(require_role("editor"))):
+    r = await db.policies.delete_one({"id": policy_id, "org_id": user["org_id"]})
+    if not r.deleted_count:
+        raise HTTPException(404, "Policy not found")
+    return {"ok": True}
+
+
+# ------------------------ decision engine ------------------------
+def _match_pattern(pattern: str, value: str) -> bool:
+    if pattern == "*" or pattern == value:
+        return True
+    # simple glob: support "prefix.*" or "*.suffix"
+    regex = "^" + re.escape(pattern).replace(r"\*", ".*") + "$"
+    return re.fullmatch(regex, value) is not None
+
+
+def _cond_ok(cond: dict, ctx: dict) -> bool:
+    field = cond["field"]
+    op = cond["op"]
+    val = cond["value"]
+    got = ctx.get(field)
+    try:
+        if op == "equals":
+            return got == val
+        if op == "not_equals":
+            return got != val
+        if op == "contains":
+            return isinstance(got, str) and str(val) in got
+        if op == "gt":
+            return got is not None and float(got) > float(val)
+        if op == "lt":
+            return got is not None and float(got) < float(val)
+        if op == "in":
+            return got in (val if isinstance(val, list) else [val])
+        if op == "not_in":
+            return got not in (val if isinstance(val, list) else [val])
+    except Exception:
+        return False
+    return False
+
+
+def _compute_risk(agent: dict, req: EvaluateIn) -> int:
+    base = agent.get("risk_score", 30)
+    action_risk = {"read": 0, "write": 20, "delete": 40, "execute": 25}.get(req.action, 10)
+    sensitive_boost = 30 if any(w in req.resource.lower() for w in ["billing", "payments", "pii", "customers", "prod"]) else 0
+    purpose_penalty = 10 if not req.purpose else 0
+    total = min(100, base + action_risk + sensitive_boost + purpose_penalty)
+    return int(total)
+
+
+def _redact_payload(value: Any) -> Any:
+    """Remove common sensitive fields before a payload is returned or persisted."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            lk = str(k).lower()
+            if any(term in lk for term in ("email", "phone", "ssn", "pan", "aadhaar", "account_number", "card_number")):
+                out[k] = "[REDACTED]"
+            else:
+                out[k] = _redact_payload(v)
+        return out
+    if isinstance(value, list):
+        return [_redact_payload(v) for v in value]
+    return value
+
+
+async def _log_decision(org_id: str, agent: dict, req: EvaluateIn, decision: str,
+                        matched_policy: Optional[dict], risk: int,
+                        modified_payload: Optional[dict], reason: str,
+                        client_ip: Optional[str] = None,
+                        user_agent: Optional[str] = None,
+                        evaluation_trace: Optional[List[dict]] = None) -> dict:
+    entry = {
+        "id": new_id(),
+        "org_id": org_id,
+        "agent_id": agent["id"],
+        "agent_name": agent["name"],
+        "resource": req.resource,
+        "action": req.action,
+        "purpose": req.purpose,
+        "risk_score": risk,
+        "decision": decision,
+        "policy_id": matched_policy["id"] if matched_policy else None,
+        "policy_name": matched_policy["name"] if matched_policy else "Default policy",
+        "reason": reason,
+        "context": req.context,
+        "payload": req.payload,
+        "modified_payload": modified_payload,
+        "evaluation_trace": evaluation_trace or [],
+        "client_ip": client_ip,
+        "user_agent": user_agent,
+        "created_at": now_utc().isoformat(),
+    }
+    await db.decisions.insert_one(entry.copy())
+    # increment counters
+    await db.agents.update_one({"id": agent["id"]}, {"$inc": {"decisions_count": 1}})
+    if matched_policy:
+        await db.policies.update_one({"id": matched_policy["id"]}, {"$inc": {"hits": 1}})
+    if decision == "escalate":
+        await db.escalations.insert_one({
+            "id": new_id(),
+            "org_id": org_id,
+            "decision_id": entry["id"],
+            "agent_id": agent["id"],
+            "agent_name": agent["name"],
+            "resource": req.resource,
+            "action": req.action,
+            "risk_score": risk,
+            "reason": reason,
+            "status": "pending",
+            "execution_released": False,
+            "created_at": now_utc().isoformat(),
+        })
+    # structured audit trail — one JSON line per decision
+    audit_log(
+        "decision",
+        decision_id=entry["id"],
+        org_id=org_id,
+        agent_id=agent["id"],
+        resource=req.resource,
+        action=req.action,
+        decision=decision,
+        risk_score=risk,
+        policy_id=entry["policy_id"],
+        client_ip=client_ip,
+    )
+    # Fan out to real-time subscribers and configured webhooks (fire and forget).
+    asyncio.create_task(_ws_broadcast(org_id, entry))
+    asyncio.create_task(_deliver_webhooks(org_id, entry))
+    entry.pop("_id", None)
+    return entry
+
+
+async def _evaluate(org_id: str, req: EvaluateIn,
+                    client_ip: Optional[str] = None,
+                    user_agent: Optional[str] = None) -> dict:
+    agent = await db.agents.find_one({"id": req.agent_id, "org_id": org_id}, {"_id": 0})
+    if not agent:
+        raise HTTPException(404, "Unknown agent")
+    trace: List[dict] = [
+        {"step": "identity", "matched": True,
+         "detail": f"Agent {agent['name']} (trust={agent.get('trust_level')})"},
+    ]
+    if agent.get("status") != "active":
+        trace.append({"step": "status", "matched": False,
+                      "detail": f"Agent is {agent.get('status')}, blocking"})
+        return await _log_decision(org_id, agent, req, "block", None, 100, None,
+                                   f"Agent status is {agent.get('status')}",
+                                   client_ip, user_agent, evaluation_trace=trace)
+    risk = _compute_risk(agent, req)
+    trace.append({"step": "risk", "matched": True,
+                  "detail": f"Computed risk score = {risk}"})
+    # Never trust agent-supplied overrides for identity, trust or risk.
+    reserved = {"risk_score", "agent_trust", "trust_level", "role", "org_id", "agent_id", "owner", "authorization"}
+    safe_context = {k: v for k, v in (req.context or {}).items() if k not in reserved}
+    ctx = {
+        "resource": req.resource,
+        "action": req.action,
+        "purpose": req.purpose or "",
+        "agent_trust": agent.get("trust_level"),
+        "risk_score": risk,
+        **safe_context,
+    }
+    trace.append({"step": "context", "matched": True, "detail": "Reserved identity/risk fields supplied by the caller were ignored." if len(safe_context) != len(req.context or {}) else "Caller context accepted; trusted identity/risk derived server-side."})
+    policies = await db.policies.find(
+        {"org_id": org_id, "enabled": True}, {"_id": 0}
+    ).sort("priority", 1).to_list(500)
+
+    for p in policies:
+        if p["subject"] != "*" and p["subject"] != req.agent_id:
+            trace.append({"step": f"policy:{p['name']}", "matched": False,
+                          "detail": f"subject '{p['subject']}' does not match agent"})
+            continue
+        if not _match_pattern(p["resource_pattern"], req.resource):
+            trace.append({"step": f"policy:{p['name']}", "matched": False,
+                          "detail": f"resource '{req.resource}' does not match pattern '{p['resource_pattern']}'"})
+            continue
+        if p["action"] != "*" and p["action"] != req.action:
+            trace.append({"step": f"policy:{p['name']}", "matched": False,
+                          "detail": f"action '{req.action}' does not match '{p['action']}'"})
+            continue
+        cond_fail = None
+        for c in p.get("conditions", []):
+            if not _cond_ok(c, ctx):
+                cond_fail = c
+                break
+        if cond_fail:
+            trace.append({"step": f"policy:{p['name']}", "matched": False,
+                          "detail": f"condition {cond_fail['field']} {cond_fail['op']} {cond_fail['value']} failed"})
+            continue
+        # matched
+        modified = None
+        reason = f"Matched policy '{p['name']}' (priority {p['priority']})"
+        trace.append({"step": f"policy:{p['name']}", "matched": True,
+                      "detail": f"effect='{p['effect']}', priority={p['priority']}"})
+        if p["effect"] == "modify":
+            modified = _redact_payload(req.payload)
+            modified["_governance"] = {"redacted_fields": ["email", "phone", "ssn", "account_number"],
+                                        "notes": p.get("modify_instructions") or "PII stripped before downstream execution"}
+        return await _log_decision(org_id, agent, req, p["effect"], p, risk, modified, reason,
+                                   client_ip, user_agent, evaluation_trace=trace)
+
+    # default: escalate if high risk, else allow
+    if risk >= 70:
+        trace.append({"step": "default", "matched": True,
+                      "detail": f"No policy matched, risk {risk} ≥ 70 → escalate"})
+        return await _log_decision(org_id, agent, req, "escalate", None, risk, None,
+                                   f"No policy matched and risk {risk} ≥ 70",
+                                   client_ip, user_agent, evaluation_trace=trace)
+    trace.append({"step": "default", "matched": True,
+                  "detail": "No explicit policy matched → deny by default"})
+    return await _log_decision(org_id, agent, req, "block", None, risk, None,
+                               "No explicit policy matched — deny by default",
+                               client_ip, user_agent, evaluation_trace=trace)
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if fwd:
+        return fwd
+    return request.client.host if request.client else "unknown"
+
+
+async def get_runtime_identity(request: Request) -> dict:
+    """Resolve JWT or RuntimeOS API-key identity for tool-bound agent calls.
+
+    API keys are hashed at rest and checked on every request. Request context
+    cannot override the authenticated org, role, trust or risk fields.
+    """
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else None
+    if token and token.startswith("mg_"):
+        key = await db.api_keys.find_one({"hash": _hash_key(token), "revoked": False}, {"_id": 0})
+        if not key:
+            audit_log("auth.api_key.rejected", ip=_client_ip(request), reason="invalid_or_revoked")
+            raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+        owner = await db.users.find_one({"org_id": key["org_id"], "email": key.get("created_by", "")}, {"_id": 0, "password_hash": 0})
+        if not owner:
+            owner = await db.users.find_one({"org_id": key["org_id"], "role": "owner"}, {"_id": 0, "password_hash": 0})
+        if not owner:
+            raise HTTPException(status_code=401, detail="API key owner not found")
+        await db.api_keys.update_one({"id": key["id"]}, {"$set": {"last_used_at": now_utc().isoformat()}})
+        return {**owner, "auth_source": "api_key", "api_key_role": key.get("role", "editor")}
+    return await get_current_user(request)
+
+
+@api.post("/evaluate", tags=["evaluate"], summary="Evaluate one agent action — the SDK hot path", response_description="A decision object with `evaluation_trace` explaining why the effect was chosen.")
+async def evaluate(body: EvaluateIn, request: Request, user=Depends(get_runtime_identity)):
+    return await _evaluate(
+        user["org_id"], body,
+        client_ip=_client_ip(request),
+        user_agent=request.headers.get("user-agent", "")[:200],
+    )
+
+
+# ------------------------ decisions / audit ------------------------
+@api.get("/decisions")
+async def list_decisions(
+    user=Depends(get_current_user),
+    limit: int = Query(100, ge=1, le=500),
+    decision: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    q: Dict[str, Any] = {"org_id": user["org_id"]}
+    if decision:
+        q["decision"] = decision
+    if agent_id:
+        q["agent_id"] = agent_id
+    if search:
+        q["$or"] = [
+            {"resource": {"$regex": search, "$options": "i"}},
+            {"agent_name": {"$regex": search, "$options": "i"}},
+            {"purpose": {"$regex": search, "$options": "i"}},
+        ]
+    items = await db.decisions.find(q, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(limit)
+    return items
+
+
+@api.get("/decisions/{decision_id}")
+async def get_decision(decision_id: str, user=Depends(get_current_user)):
+    doc = await db.decisions.find_one({"id": decision_id, "org_id": user["org_id"]}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Not found")
+    return doc
+
+
+# ------------------------ escalations ------------------------
+@api.get("/escalations")
+async def list_escalations(user=Depends(get_current_user),
+                           status_filter: str = Query("pending", alias="status")):
+    items = await db.escalations.find(
+        {"org_id": user["org_id"], "status": status_filter}, {"_id": 0}
+    ).sort("created_at", -1).to_list(200)
+    return items
+
+
+@api.post("/escalations/{esc_id}/decide")
+async def decide_escalation(esc_id: str, body: EscalationDecisionIn,
+                            user=Depends(require_role("editor"))):
+    esc = await db.escalations.find_one({"id": esc_id, "org_id": user["org_id"]})
+    if not esc:
+        raise HTTPException(404, "Not found")
+    new_status = "approved" if body.approve else "rejected"
+    release_token = None
+    if body.approve:
+        release_token = "rel_" + secrets.token_urlsafe(18)
+    await db.escalations.update_one(
+        {"id": esc_id},
+        {"$set": {
+            "status": new_status,
+            "resolved_by": user["email"],
+            "resolved_at": now_utc().isoformat(),
+            "note": body.note or "",
+            "execution_released": bool(body.approve),
+            "release_token": release_token,
+        }},
+    )
+    audit_log("escalation.decide", escalation_id=esc_id, decision_id=esc.get("decision_id"), status=new_status, released=bool(body.approve), reviewer=user["email"])
+    return {"ok": True, "status": new_status, "execution_released": bool(body.approve), "release_token": release_token}
+
+
+# ------------------------ analytics ------------------------
+@api.get("/analytics/overview")
+async def overview(user=Depends(get_current_user)):
+    org_id = user["org_id"]
+    now = now_utc()
+    since = (now - timedelta(hours=24)).isoformat()
+
+    total = await db.decisions.count_documents({"org_id": org_id})
+    total_24 = await db.decisions.count_documents({"org_id": org_id, "created_at": {"$gte": since}})
+    agents_count = await db.agents.count_documents({"org_id": org_id})
+    policies_count = await db.policies.count_documents({"org_id": org_id, "enabled": True})
+    pending_escalations = await db.escalations.count_documents({"org_id": org_id, "status": "pending"})
+
+    pipeline = [
+        {"$match": {"org_id": org_id}},
+        {"$group": {"_id": "$decision", "count": {"$sum": 1}}},
+    ]
+    mix: Dict[str, int] = {"allow": 0, "block": 0, "modify": 0, "escalate": 0}
+    async for row in db.decisions.aggregate(pipeline):
+        mix[row["_id"]] = row["count"]
+
+    # last 12 hours bucketed
+    buckets: List[Dict[str, Any]] = []
+    for i in range(11, -1, -1):
+        start = now - timedelta(hours=i + 1)
+        end = now - timedelta(hours=i)
+        cnt = await db.decisions.count_documents({
+            "org_id": org_id,
+            "created_at": {"$gte": start.isoformat(), "$lt": end.isoformat()},
+        })
+        blocks = await db.decisions.count_documents({
+            "org_id": org_id, "decision": "block",
+            "created_at": {"$gte": start.isoformat(), "$lt": end.isoformat()},
+        })
+        buckets.append({
+            "label": end.strftime("%H:00"),
+            "total": cnt,
+            "blocks": blocks,
+        })
+
+    # top agents
+    top_agents = []
+    ap = [
+        {"$match": {"org_id": org_id}},
+        {"$group": {"_id": {"id": "$agent_id", "name": "$agent_name"}, "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}}, {"$limit": 5},
+    ]
+    async for row in db.decisions.aggregate(ap):
+        top_agents.append({"agent_id": row["_id"]["id"], "name": row["_id"]["name"], "count": row["count"]})
+
+    # top blocked resources
+    top_blocked = []
+    bp = [
+        {"$match": {"org_id": org_id, "decision": "block"}},
+        {"$group": {"_id": "$resource", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}}, {"$limit": 5},
+    ]
+    async for row in db.decisions.aggregate(bp):
+        top_blocked.append({"resource": row["_id"], "count": row["count"]})
+
+    return {
+        "total": total,
+        "total_24h": total_24,
+        "agents": agents_count,
+        "active_policies": policies_count,
+        "pending_escalations": pending_escalations,
+        "mix": mix,
+        "timeline": buckets,
+        "top_agents": top_agents,
+        "top_blocked": top_blocked,
+    }
+
+
+# ------------------------ simulator ------------------------
+SIM_RESOURCES = [
+    "customers.read", "customers.export", "billing.read", "billing.write",
+    "docs.public.read", "docs.internal.read", "prod.deploy",
+    "analytics.query", "pii.email", "slack.post",
+]
+SIM_ACTIONS = ["read", "write", "execute", "delete"]
+SIM_PURPOSES = [
+    "user asked to summarize account",
+    "generating weekly digest",
+    "responding to customer email",
+    "",
+    "monthly reconciliation",
+    "debugging production incident",
+]
+
+
+@api.post("/simulate")
+async def simulate(request: Request, count: int = 10, user=Depends(get_current_user)):
+    org_id = user["org_id"]
+    agents = await db.agents.find({"org_id": org_id, "status": "active"}, {"_id": 0}).to_list(50)
+    if not agents:
+        raise HTTPException(400, "Create at least one active agent first")
+    count = max(1, min(50, int(count)))
+    ip = _client_ip(request)
+    ua = request.headers.get("user-agent", "")[:200]
+    made = []
+    for _ in range(count):
+        a = random.choice(agents)
+        req = EvaluateIn(
+            agent_id=a["id"],
+            resource=random.choice(SIM_RESOURCES),
+            action=random.choice(SIM_ACTIONS),
+            purpose=random.choice(SIM_PURPOSES),
+            context={"source": "simulator", "ip": f"10.0.{random.randint(0,255)}.{random.randint(0,255)}"},
+            payload={"demo": True},
+        )
+        made.append(await _evaluate(org_id, req, client_ip=ip, user_agent=ua))
+    return {"created": len(made), "decisions": made}
+
+
+# ============================================================
+# Public playground — no auth, shared demo tenant, rate-limited
+# ============================================================
+PUBLIC_ORG_ID = "public_demo_org"
+
+PUBLIC_SCENARIOS = [
+    {
+        "id": "pii_read",
+        "title": "CRM copilot reads a customer",
+        "resource": "customers.read", "action": "read",
+        "purpose": "Sales rep asked to summarize account #42",
+        "payload": {"customer_id": 42, "include_email": True},
+        "expect": "modify",
+    },
+    {
+        "id": "prod_delete",
+        "title": "DevOps copilot deletes production",
+        "resource": "prod.deploy", "action": "delete",
+        "purpose": "cleanup old build",
+        "payload": {"target": "prod-us-east"},
+        "expect": "block",
+    },
+    {
+        "id": "billing_high_risk",
+        "title": "Finance agent transfers funds",
+        "resource": "billing.write", "action": "write",
+        "purpose": "wire $85,000 to vendor",
+        "payload": {"amount_usd": 85000, "vendor": "ACME"},
+        "expect": "escalate",
+    },
+    {
+        "id": "docs_public",
+        "title": "Support bot reads public docs",
+        "resource": "docs.public.read", "action": "read",
+        "purpose": "answer FAQ",
+        "payload": {"topic": "refunds"},
+        "expect": "allow",
+    },
+]
+
+
+async def _ensure_public_demo() -> str:
+    """Idempotently seed the public playground tenant with sample agents + policies."""
+    org = await db.orgs.find_one({"id": PUBLIC_ORG_ID})
+    if not org:
+        await db.orgs.insert_one({"id": PUBLIC_ORG_ID, "name": "RuntimeOS Public Playground",
+                                  "created_at": now_utc().isoformat(),
+                                  "api_key": "sk_gov_public_readonly"})
+    if await db.agents.count_documents({"org_id": PUBLIC_ORG_ID}) == 0:
+        for a in [
+            {"name": "CRMCopilot",   "framework": "openai",    "trust_level": "medium",
+             "description": "Sales-side CRM copilot",  "capabilities": ["read_crm"]},
+            {"name": "DevOpsCopilot","framework": "anthropic", "trust_level": "low",
+             "description": "Runs deploys",             "capabilities": ["deploy"]},
+            {"name": "FinanceAssist","framework": "custom",    "trust_level": "medium",
+             "description": "Handles payouts",          "capabilities": ["write_billing"]},
+            {"name": "SupportBot",   "framework": "langchain", "trust_level": "high",
+             "description": "Answers public FAQs",      "capabilities": ["read_docs"]},
+        ]:
+            await db.agents.insert_one({**a, "id": new_id(), "org_id": PUBLIC_ORG_ID, "status": "active",
+                                        "risk_score": {"low": 15, "medium": 45, "high": 75}[a["trust_level"]],
+                                        "decisions_count": 0, "created_at": now_utc().isoformat()})
+    if await db.policies.count_documents({"org_id": PUBLIC_ORG_ID}) == 0:
+        for p in [
+            {"name": "Block deletions on production", "priority": 10, "subject": "*",
+             "resource_pattern": "prod.*", "action": "delete", "conditions": [],
+             "effect": "block", "description": "No agent may delete production resources."},
+            {"name": "Redact PII on customer reads", "priority": 20, "subject": "*",
+             "resource_pattern": "customers.*", "action": "read", "conditions": [],
+             "effect": "modify", "modify_instructions": "Strip email, phone, SSN.",
+             "description": "Enforce data protection by design."},
+            {"name": "Escalate high-risk writes", "priority": 30, "subject": "*",
+             "resource_pattern": "*", "action": "write",
+             "conditions": [{"field": "risk_score", "op": "gt", "value": 60}],
+             "effect": "escalate", "description": "Human-in-the-loop above the risk threshold."},
+            {"name": "Allow public docs", "priority": 40, "subject": "*",
+             "resource_pattern": "docs.public.*", "action": "read", "conditions": [],
+             "effect": "allow", "description": "Public documentation reads are always allowed."},
+        ]:
+            await db.policies.insert_one({**p, "id": new_id(), "org_id": PUBLIC_ORG_ID,
+                                          "enabled": True, "hits": 0, "version": 1,
+                                          "created_at": now_utc().isoformat()})
+    return PUBLIC_ORG_ID
+
+
+class PublicEvaluateIn(BaseModel):
+    scenario_id: Optional[str] = Field(default=None, max_length=40)
+    resource: Optional[str] = Field(default=None, max_length=200)
+    action: Optional[str] = Field(default=None, max_length=40)
+    purpose: Optional[str] = Field(default=None, max_length=500)
+    payload: Optional[Dict[str, Any]] = None
+    agent_name: Optional[str] = Field(default=None, max_length=40)  # CRMCopilot / DevOpsCopilot / ...
+
+
+@api.get("/public/scenarios", tags=["public"], summary="Canned playground scenarios and seeded agents/policies")
+async def public_scenarios():
+    await _ensure_public_demo()
+    agents = await db.agents.find({"org_id": PUBLIC_ORG_ID}, {"_id": 0, "id": 1, "name": 1,
+                                                                "trust_level": 1, "description": 1}).to_list(20)
+    policies = await db.policies.find({"org_id": PUBLIC_ORG_ID}, {"_id": 0}).sort("priority", 1).to_list(20)
+    return {"scenarios": PUBLIC_SCENARIOS, "agents": agents, "policies": policies}
+
+
+@api.post("/public/evaluate", tags=["public"], summary="No-auth public playground — hits a shared demo tenant")
+async def public_evaluate(body: PublicEvaluateIn, request: Request):
+    await _ensure_public_demo()
+    # pick scenario if referenced
+    scen = None
+    if body.scenario_id:
+        scen = next((s for s in PUBLIC_SCENARIOS if s["id"] == body.scenario_id), None)
+    resource = body.resource or (scen["resource"] if scen else "customers.read")
+    action = body.action or (scen["action"] if scen else "read")
+    purpose = body.purpose or (scen["purpose"] if scen else "")
+    payload = body.payload if body.payload is not None else (scen["payload"] if scen else {})
+    # pick agent by name (or first active)
+    agent = None
+    if body.agent_name:
+        agent = await db.agents.find_one({"org_id": PUBLIC_ORG_ID, "name": body.agent_name}, {"_id": 0})
+    if not agent:
+        agent = await db.agents.find_one({"org_id": PUBLIC_ORG_ID, "status": "active"}, {"_id": 0})
+    if not agent:
+        raise HTTPException(500, "Public demo not seeded")
+    req = EvaluateIn(agent_id=agent["id"], resource=resource, action=action,
+                     purpose=purpose, payload=payload,
+                     context={"source": "public_playground",
+                              "ip_hash": hashlib.sha256(_client_ip(request).encode()).hexdigest()[:12]})
+    return await _evaluate(PUBLIC_ORG_ID, req,
+                           client_ip=_client_ip(request),
+                           user_agent=request.headers.get("user-agent", "")[:200])
+
+
+@api.get("/public/decisions")
+async def public_decisions(limit: int = 12):
+    limit = max(1, min(50, limit))
+    items = await db.decisions.find({"org_id": PUBLIC_ORG_ID},
+                                    {"_id": 0, "payload": 0, "modified_payload": 0,
+                                     "context": 0, "client_ip": 0, "user_agent": 0}
+                                    ).sort("created_at", -1).limit(limit).to_list(limit)
+    return items
+
+
+# ---------- Public lead capture (Book a pilot) ----------
+class LeadIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    email: EmailStr
+    company: str = Field(min_length=1, max_length=120)
+    role: str = Field(default="", max_length=80)
+    team_size: str = Field(default="", max_length=40)
+    agent_count: str = Field(default="", max_length=40)
+    frameworks: List[str] = Field(default_factory=list, max_length=12)
+    timeline: str = Field(default="", max_length=40)
+    message: str = Field(default="", max_length=2000)
+    source: str = Field(default="pilot", max_length=40)  # pilot / pricing / demo / contact
+
+
+@api.post("/public/leads", tags=["public"], summary="Book-a-pilot / demo-request lead capture")
+async def create_lead(body: LeadIn, request: Request):
+    doc = {
+        **body.model_dump(),
+        "id": new_id(),
+        "created_at": now_utc().isoformat(),
+        "client_ip": _client_ip(request),
+        "user_agent": request.headers.get("user-agent", "")[:200],
+        "status": "new",
+    }
+    await db.leads.insert_one(doc)
+    audit_log("lead.new", email=body.email.lower(), company=body.company,
+              source=body.source, ip=doc["client_ip"])
+    # Fire the same webhook fan-out we use for decisions — teams may want a Slack ping.
+    asyncio.create_task(_notify_lead(doc))
+    doc.pop("_id", None)
+    return {"ok": True, "id": doc["id"]}
+
+
+async def _notify_lead(lead: dict) -> None:
+    """Deliver 'new pilot request' events to every webhook configured on the
+    seeded admin's org — this is the closest thing we have to a CRM sink in
+    the preview. Real deployments would push to Salesforce / HubSpot here."""
+    try:
+        admin = await db.users.find_one({"role": "owner", "email": os.environ.get("ADMIN_EMAIL", "").lower()})
+        if not admin:
+            return
+        hooks = await db.webhooks.find({"org_id": admin["org_id"], "enabled": True}, {"_id": 0}).to_list(20)
+        summary = (f"🚀 New RuntimeOS pilot request: *{lead['company']}* — "
+                   f"{lead['name']} <{lead['email']}> — team {lead.get('team_size', '?')} "
+                   f"agents {lead.get('agent_count', '?')} timeline {lead.get('timeline', '?')}")
+        for wh in hooks:
+            body = ({"text": summary} if wh["kind"] == "slack"
+                    else {"event": "lead.new", "lead": lead})
+            await _post_webhook(wh, body)
+    except Exception:
+        logger.exception("_notify_lead failed")
+
+
+@api.get("/leads", tags=["public"], summary="List captured leads (admin only)")
+async def list_leads(user=Depends(require_role("admin")), limit: int = 100):
+    items = await db.leads.find({}, {"_id": 0}).sort("created_at", -1).limit(min(200, limit)).to_list(200)
+    return items
+
+
+# ============================================================
+# V2 — API keys, webhooks, connectors, members/RBAC,
+# policy versions/rollback, compliance, heatmap, WebSocket
+# ============================================================
+
+# ---------- WebSocket hub (per-org fan-out) ----------
+class _WsHub:
+    def __init__(self):
+        self._conns: Dict[str, Set[WebSocket]] = {}
+
+    async def connect(self, org_id: str, ws: WebSocket):
+        await ws.accept()
+        self._conns.setdefault(org_id, set()).add(ws)
+
+    def disconnect(self, org_id: str, ws: WebSocket):
+        self._conns.get(org_id, set()).discard(ws)
+
+    async def broadcast(self, org_id: str, message: dict):
+        dead: List[WebSocket] = []
+        for w in list(self._conns.get(org_id, set())):
+            try:
+                await w.send_json(message)
+            except Exception:
+                dead.append(w)
+        for w in dead:
+            self.disconnect(org_id, w)
+
+
+ws_hub = _WsHub()
+
+
+async def _ws_broadcast(org_id: str, decision: dict) -> None:
+    try:
+        # slim payload — drop bulky fields
+        payload = {k: v for k, v in decision.items() if k not in ("evaluation_trace", "payload", "modified_payload", "_id")}
+        await ws_hub.broadcast(org_id, {"type": "decision", "data": payload})
+    except Exception:
+        logger.exception("ws_broadcast failed")
+
+
+@app.websocket("/api/ws/decisions")
+async def ws_decisions(ws: WebSocket, token: str = Query(...)):
+    """Bearer-authenticated per-tenant live decision stream."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        org_id = payload["org_id"]
+    except Exception:
+        await ws.close(code=1008)
+        return
+    await ws_hub.connect(org_id, ws)
+    try:
+        await ws.send_json({"type": "hello", "org_id": org_id})
+        while True:
+            # keep alive; discard incoming messages
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ws_hub.disconnect(org_id, ws)
+
+
+# ---------- API keys ----------
+class ApiKeyIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80, pattern=_NAME_RE)
+    role: Literal["viewer", "editor", "admin"] = "editor"
+
+
+def _hash_key(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@api.get("/api-keys")
+async def list_keys(user=Depends(get_current_user)):
+    keys = await db.api_keys.find({"org_id": user["org_id"], "revoked": False},
+                                  {"_id": 0, "hash": 0}).sort("created_at", -1).to_list(200)
+    return keys
+
+
+@api.post("/api-keys")
+async def create_key(body: ApiKeyIn, user=Depends(require_role("admin"))):
+    raw = "mg_" + secrets.token_urlsafe(28)
+    doc = {
+        "id": new_id(),
+        "org_id": user["org_id"],
+        "name": body.name,
+        "role": body.role,
+        "prefix": raw[:8],
+        "suffix": raw[-4:],
+        "hash": _hash_key(raw),
+        "created_by": user["email"],
+        "created_at": now_utc().isoformat(),
+        "last_used_at": None,
+        "revoked": False,
+    }
+    await db.api_keys.insert_one(doc)
+    audit_log("apikey.create", org_id=user["org_id"], key_id=doc["id"], name=body.name)
+    doc.pop("_id", None)
+    doc.pop("hash", None)
+    return {**doc, "secret": raw}  # returned ONCE only
+
+
+@api.post("/api-keys/{key_id}/rotate")
+async def rotate_key(key_id: str, user=Depends(require_role("admin"))):
+    raw = "mg_" + secrets.token_urlsafe(28)
+    r = await db.api_keys.update_one(
+        {"id": key_id, "org_id": user["org_id"], "revoked": False},
+        {"$set": {"hash": _hash_key(raw), "prefix": raw[:8], "suffix": raw[-4:],
+                  "rotated_at": now_utc().isoformat()}},
+    )
+    if not r.matched_count:
+        raise HTTPException(404, "Key not found")
+    audit_log("apikey.rotate", org_id=user["org_id"], key_id=key_id)
+    return {"id": key_id, "secret": raw}
+
+
+@api.post("/api-keys/{key_id}/revoke")
+async def revoke_key(key_id: str, user=Depends(require_role("admin"))):
+    r = await db.api_keys.update_one(
+        {"id": key_id, "org_id": user["org_id"]},
+        {"$set": {"revoked": True, "revoked_at": now_utc().isoformat()}},
+    )
+    if not r.matched_count:
+        raise HTTPException(404, "Key not found")
+    audit_log("apikey.revoke", org_id=user["org_id"], key_id=key_id)
+    return {"ok": True}
+
+
+# ---------- Webhooks ----------
+class WebhookIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80, pattern=_NAME_RE)
+    url: str = Field(min_length=8, max_length=400)
+    kind: Literal["slack", "teams", "pagerduty", "custom"] = "custom"
+    events: List[Literal["block", "escalate", "modify", "allow"]] = Field(default_factory=lambda: ["block", "escalate"])
+    enabled: bool = True
+
+
+@api.get("/webhooks")
+async def list_webhooks(user=Depends(get_current_user)):
+    items = await db.webhooks.find({"org_id": user["org_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return items
+
+
+@api.post("/webhooks")
+async def create_webhook(body: WebhookIn, user=Depends(require_role("admin"))):
+    doc = {**body.model_dump(), "id": new_id(), "org_id": user["org_id"],
+           "created_at": now_utc().isoformat(), "delivery_count": 0, "last_delivered_at": None}
+    await db.webhooks.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.patch("/webhooks/{wid}")
+async def update_webhook(wid: str, body: WebhookIn, user=Depends(require_role("admin"))):
+    r = await db.webhooks.update_one({"id": wid, "org_id": user["org_id"]}, {"$set": body.model_dump()})
+    if not r.matched_count:
+        raise HTTPException(404, "Not found")
+    return await db.webhooks.find_one({"id": wid}, {"_id": 0})
+
+
+@api.delete("/webhooks/{wid}")
+async def delete_webhook(wid: str, user=Depends(require_role("admin"))):
+    r = await db.webhooks.delete_one({"id": wid, "org_id": user["org_id"]})
+    if not r.deleted_count:
+        raise HTTPException(404, "Not found")
+    return {"ok": True}
+
+
+@api.post("/webhooks/{wid}/test")
+async def test_webhook(wid: str, user=Depends(require_role("admin"))):
+    wh = await db.webhooks.find_one({"id": wid, "org_id": user["org_id"]}, {"_id": 0})
+    if not wh:
+        raise HTTPException(404, "Not found")
+    ok, status_code = await _post_webhook(wh, {
+        "type": "test",
+        "message": "RuntimeOS test event from " + user["email"],
+        "ts": now_utc().isoformat(),
+    })
+    return {"ok": ok, "status": status_code}
+
+
+def _format_webhook_payload(wh: dict, decision: dict) -> dict:
+    d = decision
+    title = f"[{d['decision'].upper()}] {d['agent_name']} → {d['action']} {d['resource']}"
+    detail = f"Policy: {d['policy_name']} · Risk: {d['risk_score']} · Reason: {d['reason']}"
+    if wh["kind"] == "slack":
+        return {"text": f"*{title}*\n{detail}"}
+    if wh["kind"] == "teams":
+        return {"@type": "MessageCard", "@context": "https://schema.org/extensions",
+                "summary": title, "themeColor": "FF3366",
+                "sections": [{"activityTitle": title, "text": detail}]}
+    if wh["kind"] == "pagerduty":
+        return {"payload": {"summary": title, "severity": "warning", "source": "RuntimeOS",
+                            "custom_details": {"reason": d["reason"], "risk": d["risk_score"]}},
+                "routing_key": "PLACEHOLDER", "event_action": "trigger"}
+    return {"event": "decision", "decision": d}
+
+
+async def _post_webhook(wh: dict, body: dict) -> (bool, int):
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.post(wh["url"], json=body, headers={"User-Agent": "RuntimeOS/1.0"})
+            return (200 <= r.status_code < 300), r.status_code
+    except Exception as e:
+        logger.warning("webhook delivery failed for %s: %s", wh.get("id"), e)
+        return False, 0
+
+
+async def _deliver_webhooks(org_id: str, decision: dict) -> None:
+    try:
+        hooks = await db.webhooks.find({"org_id": org_id, "enabled": True}, {"_id": 0}).to_list(50)
+        for wh in hooks:
+            if decision["decision"] not in wh.get("events", []):
+                continue
+            body = _format_webhook_payload(wh, decision)
+            ok, code = await _post_webhook(wh, body)
+            await db.webhooks.update_one({"id": wh["id"]},
+                                         {"$inc": {"delivery_count": 1},
+                                          "$set": {"last_delivered_at": now_utc().isoformat(),
+                                                    "last_status": code}})
+            audit_log("webhook.deliver", org_id=org_id, webhook_id=wh["id"],
+                      status=code, ok=ok, decision_id=decision["id"])
+    except Exception:
+        logger.exception("_deliver_webhooks failed")
+
+
+# ---------- Connectors ----------
+CONNECTOR_KINDS = ["postgres", "mongodb", "surrealdb", "redis", "pinecone", "qdrant", "rest"]
+
+
+class ConnectorIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80, pattern=_NAME_RE)
+    kind: Literal["postgres", "mongodb", "surrealdb", "redis", "pinecone", "qdrant", "rest"]
+    config: Dict[str, Any] = Field(default_factory=dict)  # host, port, url, api_key, etc.
+    scope: str = Field(default="", max_length=120)  # e.g. "customers.*"
+
+
+@api.get("/connectors")
+async def list_connectors(user=Depends(get_current_user)):
+    items = await db.connectors.find({"org_id": user["org_id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return items
+
+
+@api.post("/connectors")
+async def create_connector(body: ConnectorIn, user=Depends(require_role("editor"))):
+    doc = {**body.model_dump(), "id": new_id(), "org_id": user["org_id"],
+           "status": "unknown", "created_at": now_utc().isoformat()}
+    # Redact obvious secret fields when storing (still keep, just mark)
+    await db.connectors.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.patch("/connectors/{cid}")
+async def update_connector(cid: str, body: ConnectorIn, user=Depends(require_role("editor"))):
+    r = await db.connectors.update_one({"id": cid, "org_id": user["org_id"]}, {"$set": body.model_dump()})
+    if not r.matched_count:
+        raise HTTPException(404, "Not found")
+    return await db.connectors.find_one({"id": cid}, {"_id": 0})
+
+
+@api.delete("/connectors/{cid}")
+async def delete_connector(cid: str, user=Depends(require_role("editor"))):
+    r = await db.connectors.delete_one({"id": cid, "org_id": user["org_id"]})
+    if not r.deleted_count:
+        raise HTTPException(404, "Not found")
+    return {"ok": True}
+
+
+@api.post("/connectors/{cid}/test")
+async def test_connector(cid: str, user=Depends(get_current_user)):
+    c = await db.connectors.find_one({"id": cid, "org_id": user["org_id"]}, {"_id": 0})
+    if not c:
+        raise HTTPException(404, "Not found")
+    kind = c["kind"]
+    cfg = c.get("config", {})
+    ok = False
+    detail = ""
+    try:
+        if kind == "rest":
+            url = cfg.get("url", "")
+            async with httpx.AsyncClient(timeout=4.0) as cli:
+                r = await cli.get(url, headers=cfg.get("headers") or {})
+                ok = r.status_code < 500
+                detail = f"HTTP {r.status_code}"
+        elif kind == "mongodb":
+            url = cfg.get("url", "")
+            tmp = AsyncIOMotorClient(url, serverSelectionTimeoutMS=2500)
+            info = await tmp.admin.command("ping")
+            ok = bool(info.get("ok"))
+            detail = "ping ok" if ok else "ping failed"
+            tmp.close()
+        else:
+            # For demo: heuristic — if a URL/host is provided we mark reachable.
+            has_target = any(cfg.get(k) for k in ("url", "host", "endpoint"))
+            ok = has_target
+            detail = "config accepted" if ok else "missing host/url"
+    except Exception as e:
+        ok = False
+        detail = str(e)[:200]
+    await db.connectors.update_one({"id": cid}, {"$set": {
+        "status": "healthy" if ok else "degraded",
+        "last_tested_at": now_utc().isoformat(),
+        "last_test_detail": detail,
+    }})
+    return {"ok": ok, "detail": detail}
+
+
+# ---------- Members / RBAC ----------
+class InviteIn(BaseModel):
+    email: EmailStr
+    name: str = Field(min_length=1, max_length=80)
+    role: Literal["viewer", "editor", "admin"] = "editor"
+    password: str = Field(min_length=8, max_length=128)
+
+
+class RoleUpdateIn(BaseModel):
+    role: Literal["viewer", "editor", "admin", "owner"]
+
+
+@api.get("/members")
+async def list_members(user=Depends(get_current_user)):
+    items = await db.users.find({"org_id": user["org_id"]},
+                                {"_id": 0, "password_hash": 0}).sort("created_at", 1).to_list(500)
+    return items
+
+
+@api.post("/members")
+async def invite_member(body: InviteIn, user=Depends(require_role("admin"))):
+    email = body.email.lower()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(400, "Email already in use")
+    doc = {
+        "id": new_id(),
+        "org_id": user["org_id"],
+        "email": email,
+        "name": body.name,
+        "role": body.role,
+        "password_hash": hash_password(body.password),
+        "invited_by": user["email"],
+        "created_at": now_utc().isoformat(),
+    }
+    await db.users.insert_one(doc)
+    audit_log("member.invite", org_id=user["org_id"], email=email, role=body.role)
+    doc.pop("_id", None)
+    doc.pop("password_hash", None)
+    return doc
+
+
+@api.patch("/members/{uid}")
+async def change_role(uid: str, body: RoleUpdateIn, user=Depends(require_role("admin"))):
+    target = await db.users.find_one({"id": uid, "org_id": user["org_id"]})
+    if not target:
+        raise HTTPException(404, "Not found")
+    if target["role"] == "owner" and body.role != "owner":
+        raise HTTPException(400, "Cannot demote the owner")
+    if body.role == "owner":
+        raise HTTPException(400, "Ownership transfer requires a separate endpoint")
+    await db.users.update_one({"id": uid}, {"$set": {"role": body.role}})
+    audit_log("member.role", org_id=user["org_id"], target_id=uid, role=body.role)
+    return {"ok": True}
+
+
+@api.delete("/members/{uid}")
+async def remove_member(uid: str, user=Depends(require_role("admin"))):
+    target = await db.users.find_one({"id": uid, "org_id": user["org_id"]})
+    if not target:
+        raise HTTPException(404, "Not found")
+    if target["role"] == "owner":
+        raise HTTPException(400, "Cannot remove owner")
+    if target["id"] == user["id"]:
+        raise HTTPException(400, "Cannot remove yourself")
+    await db.users.delete_one({"id": uid})
+    audit_log("member.remove", org_id=user["org_id"], target_id=uid)
+    return {"ok": True}
+
+
+# ---------- Policy versions / rollback ----------
+@api.get("/policies/{policy_id}/versions")
+async def list_policy_versions(policy_id: str, user=Depends(get_current_user)):
+    items = await db.policy_versions.find(
+        {"policy_id": policy_id, "org_id": user["org_id"]}, {"_id": 0}
+    ).sort("version", -1).to_list(200)
+    return items
+
+
+@api.post("/policies/{policy_id}/rollback/{version}")
+async def rollback_policy(policy_id: str, version: int, user=Depends(require_role("editor"))):
+    ver = await db.policy_versions.find_one(
+        {"policy_id": policy_id, "org_id": user["org_id"], "version": version}, {"_id": 0}
+    )
+    if not ver:
+        raise HTTPException(404, "Version not found")
+    existing = await db.policies.find_one({"id": policy_id, "org_id": user["org_id"]}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Policy not found")
+    # snapshot current before overwrite
+    await db.policy_versions.insert_one({
+        "id": new_id(), "policy_id": policy_id, "org_id": user["org_id"],
+        "version": existing.get("version", 1), "snapshot": existing,
+        "changed_by": user["email"] + " (pre-rollback)",
+        "created_at": now_utc().isoformat(),
+    })
+    snap = ver["snapshot"]
+    snap["version"] = existing.get("version", 1) + 1
+    snap.pop("_id", None)
+    await db.policies.update_one({"id": policy_id, "org_id": user["org_id"]}, {"$set": snap})
+    audit_log("policy.rollback", org_id=user["org_id"], policy_id=policy_id, to_version=version)
+    return {"ok": True, "version": snap["version"]}
+
+
+# ---------- Compliance ----------
+COMPLIANCE_FRAMEWORKS = {
+    "soc2": {
+        "name": "SOC 2 Type II",
+        "controls": [
+            ("CC1.1", "Governance policies defined", lambda s: s["policies"] >= 1),
+            ("CC5.2", "Access reviewed via decision log", lambda s: s["decisions_total"] >= 1),
+            ("CC6.1", "Logical access via authenticated agents", lambda s: s["agents"] >= 1),
+            ("CC7.2", "Anomalies flagged & escalated", lambda s: s["escalations_total"] >= 0),
+            ("CC7.3", "Continuous audit trail retained", lambda s: s["audit_lines"] >= 1),
+            ("CC8.1", "Change management via policy versioning", lambda s: s["policy_versions"] >= 0),
+        ],
+    },
+    "iso27001": {
+        "name": "ISO/IEC 27001:2022",
+        "controls": [
+            ("A.5.15", "Access control policies defined", lambda s: s["policies"] >= 1),
+            ("A.8.2",  "Privileged access rights governed", lambda s: True),
+            ("A.8.15", "Logging enabled for AI actions",   lambda s: s["decisions_total"] >= 1),
+            ("A.8.16", "Monitoring & alerting configured", lambda s: s["webhooks"] >= 0),
+            ("A.5.30", "ICT readiness for continuity",     lambda s: True),
+        ],
+    },
+    "gdpr": {
+        "name": "GDPR",
+        "controls": [
+            ("Art. 5",  "Lawful processing tracked in decisions", lambda s: s["decisions_total"] >= 1),
+            ("Art. 15", "Data subject access via audit log",       lambda s: True),
+            ("Art. 25", "Data protection by design (PII redact)",  lambda s: s["modify_policies"] >= 0),
+            ("Art. 30", "Records of processing activities",        lambda s: s["audit_lines"] >= 1),
+            ("Art. 32", "Security of processing (encryption etc.)", lambda s: True),
+        ],
+    },
+    "hipaa": {
+        "name": "HIPAA Security Rule",
+        "controls": [
+            ("§164.308(a)(3)", "Workforce access management",      lambda s: s["members"] >= 1),
+            ("§164.308(a)(5)", "Security awareness (audit trail)", lambda s: s["audit_lines"] >= 1),
+            ("§164.312(a)",    "Access control (unique agent ID)",  lambda s: s["agents"] >= 1),
+            ("§164.312(b)",    "Audit controls",                    lambda s: s["decisions_total"] >= 1),
+            ("§164.312(e)",    "Transmission security (TLS)",       lambda s: True),
+        ],
+    },
+}
+
+
+async def _compliance_stats(org_id: str) -> dict:
+    return {
+        "policies": await db.policies.count_documents({"org_id": org_id, "enabled": True}),
+        "agents": await db.agents.count_documents({"org_id": org_id}),
+        "decisions_total": await db.decisions.count_documents({"org_id": org_id}),
+        "escalations_total": await db.escalations.count_documents({"org_id": org_id}),
+        "policy_versions": await db.policy_versions.count_documents({"org_id": org_id}),
+        "webhooks": await db.webhooks.count_documents({"org_id": org_id, "enabled": True}),
+        "members": await db.users.count_documents({"org_id": org_id}),
+        "audit_lines": await db.decisions.count_documents({"org_id": org_id}),
+        "modify_policies": await db.policies.count_documents({"org_id": org_id, "effect": "modify"}),
+    }
+
+
+@api.get("/compliance/report")
+async def compliance_report(framework: str = Query("soc2"), user=Depends(get_current_user)):
+    fw = COMPLIANCE_FRAMEWORKS.get(framework.lower())
+    if not fw:
+        raise HTTPException(400, "Unknown framework")
+    stats = await _compliance_stats(user["org_id"])
+    controls = []
+    for code, name, check in fw["controls"]:
+        controls.append({"code": code, "name": name, "status": "pass" if check(stats) else "attention"})
+    passed = sum(1 for c in controls if c["status"] == "pass")
+    return {
+        "framework": framework, "framework_name": fw["name"],
+        "org_id": user["org_id"], "generated_at": now_utc().isoformat(),
+        "coverage": round(100 * passed / max(1, len(controls))),
+        "stats": stats, "controls": controls,
+    }
+
+
+@api.get("/compliance/export.csv")
+async def compliance_export(framework: str = Query("soc2"), user=Depends(get_current_user)):
+    report = await compliance_report(framework, user)  # reuse
+    lines = ["framework,code,control,status,generated_at,org_id"]
+    for c in report["controls"]:
+        lines.append(f'{report["framework_name"]},{c["code"]},"{c["name"]}",{c["status"]},{report["generated_at"]},{report["org_id"]}')
+    return StreamingResponse(
+        iter(["\n".join(lines) + "\n"]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="memorygate_{framework}_report.csv"'},
+    )
+
+
+# ---------- Risk heatmap ----------
+_HEATMAP_ACTIONS = ["read", "write", "execute", "delete"]
+
+
+@api.get("/analytics/heatmap")
+async def heatmap(user=Depends(get_current_user)):
+    org_id = user["org_id"]
+    pipeline = [
+        {"$match": {"org_id": org_id}},
+        {"$group": {
+            "_id": {"resource": "$resource", "action": "$action"},
+            "count": {"$sum": 1},
+            "avg_risk": {"$avg": "$risk_score"},
+            "blocks": {"$sum": {"$cond": [{"$eq": ["$decision", "block"]}, 1, 0]}},
+        }},
+        {"$sort": {"count": -1}},
+        {"$limit": 30},
+    ]
+    resources: List[str] = []
+    matrix: Dict[str, Dict[str, dict]] = {}
+    async for row in db.decisions.aggregate(pipeline):
+        r = row["_id"]["resource"]
+        a = row["_id"]["action"]
+        if r not in resources:
+            resources.append(r)
+        matrix.setdefault(r, {})[a] = {
+            "count": row["count"],
+            "avg_risk": round(row["avg_risk"] or 0),
+            "blocks": row["blocks"],
+        }
+    resources = resources[:10]
+    cells = []
+    for r in resources:
+        for a in _HEATMAP_ACTIONS:
+            cell = matrix.get(r, {}).get(a) or {"count": 0, "avg_risk": 0, "blocks": 0}
+            cells.append({"resource": r, "action": a, **cell})
+    return {"resources": resources, "actions": _HEATMAP_ACTIONS, "cells": cells}
+
+
+
+
+
+# ============================================================
+# Dodo Payments + Breeth memory integrations
+# ============================================================
+try:
+    from dodopayments import AsyncDodoPayments  # type: ignore
+    _DODO_OK = True
+except Exception:  # pragma: no cover
+    AsyncDodoPayments = None
+    _DODO_OK = False
+
+DODO_PACKAGES: Dict[str, Dict[str, Any]] = {
+    "growth_monthly": {
+        "name": "RuntimeOS Growth (monthly)",
+        "tier": "growth",
+        "product_env": "DODO_GROWTH_MONTHLY_PRODUCT_ID",
+    },
+    "growth_annual": {
+        "name": "RuntimeOS Growth (annual)",
+        "tier": "growth",
+        "product_env": "DODO_GROWTH_ANNUAL_PRODUCT_ID",
+    },
+}
+
+class DodoCheckoutIn(BaseModel):
+    package_id: Literal["growth_monthly", "growth_annual"]
+    origin_url: str = Field(min_length=8, max_length=400)
+    email: Optional[EmailStr] = None
+    company: Optional[str] = Field(default=None, max_length=120)
+
+
+def _dodo_client():
+    if not _DODO_OK:
+        raise HTTPException(500, "Dodo Payments SDK is not installed")
+    key = os.environ.get("DODO_PAYMENTS_API_KEY", "")
+    if not key:
+        raise HTTPException(500, "Dodo Payments not configured — set DODO_PAYMENTS_API_KEY.")
+    return AsyncDodoPayments(
+        bearer_token=key,
+        environment=os.environ.get("DODO_PAYMENTS_ENVIRONMENT", "test_mode"),
+    )
+
+
+@api.post("/payments/checkout", tags=["public"],
+          summary="Create a Dodo Payments Checkout Session")
+async def create_dodo_checkout(body: DodoCheckoutIn, request: Request):
+    pkg = DODO_PACKAGES.get(body.package_id)
+    if not pkg:
+        raise HTTPException(400, "Unknown package")
+    product_id = os.environ.get(pkg["product_env"], "")
+    if not product_id:
+        raise HTTPException(500, f"Dodo product not configured — set {pkg['product_env']}.")
+    client = _dodo_client()
+    origin = body.origin_url.rstrip("/")
+    checkout_ref = secrets.token_urlsafe(18)
+    success_url = f"{origin}/pricing/success?checkout_ref={checkout_ref}"
+    metadata = {
+        "package_id": body.package_id,
+        "tier": pkg["tier"],
+        "source": "pricing_page",
+        "email": (body.email or "").lower(),
+        "company": body.company or "",
+        "checkout_ref": checkout_ref,
+    }
+    try:
+        session = await client.checkout_sessions.create(
+            product_cart=[{"product_id": product_id, "quantity": 1}],
+            customer=(
+                {"email": str(body.email), "name": body.company or "RuntimeOS customer"}
+                if body.email else None
+            ),
+            return_url=success_url,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        logger.exception("Dodo checkout creation failed")
+        raise HTTPException(400, f"Dodo checkout failed: {str(exc)[:240]}")
+
+    session_id = getattr(session, "session_id", None) or getattr(session, "id", None)
+    checkout_url = getattr(session, "url", None) or getattr(session, "checkout_url", None)
+    if not session_id or not checkout_url:
+        raise HTTPException(502, "Dodo returned an incomplete checkout session")
+
+    await db.payment_transactions.insert_one({
+        "provider": "dodo",
+        "session_id": session_id,
+        "checkout_ref": checkout_ref,
+        "package_id": body.package_id,
+        "tier": pkg["tier"],
+        "payment_status": "initiated",
+        "amount_total": None,
+        "currency": "usd",
+        "email": (body.email or "").lower(),
+        "company": body.company or "",
+        "created_at": now_utc().isoformat(),
+    })
+    audit_log("dodo.checkout.create", package_id=body.package_id,
+              session_id=session_id, tier=pkg["tier"])
+    return {"url": checkout_url, "session_id": session_id, "checkout_ref": checkout_ref, "provider": "dodo"}
+
+
+@api.get("/payments/status/{session_id}", tags=["public"],
+         summary="Return the locally recorded Dodo payment status")
+async def dodo_checkout_status(session_id: str):
+    record = await db.payment_transactions.find_one(
+        {"$or": [{"session_id": session_id}, {"checkout_ref": session_id}], "provider": "dodo"}, {"_id": 0}
+    )
+    if not record:
+        raise HTTPException(404, "Payment session not found")
+    return {
+        "session_id": session_id,
+        "payment_status": record.get("payment_status", "initiated"),
+        "status": record.get("status", record.get("payment_status", "initiated")),
+        "amount_total": record.get("amount_total") or 0,
+        "currency": record.get("currency", "usd"),
+        "package_id": record.get("package_id", ""),
+        "provider": "dodo",
+    }
+
+
+@api.post("/webhook/dodo-payments", tags=["public"],
+          summary="Dodo Payments webhook")
+async def dodo_webhook(request: Request):
+    payload = await request.body()
+    secret = os.environ.get("DODO_PAYMENTS_WEBHOOK_KEY", "")
+    if not secret:
+        raise HTTPException(500, "Dodo webhook not configured — set DODO_PAYMENTS_WEBHOOK_KEY.")
+
+    # Standard Webhooks: HMAC-SHA256 over id.timestamp.payload.
+    webhook_id = request.headers.get("webhook-id", "")
+    webhook_ts = request.headers.get("webhook-timestamp", "")
+    signature_header = request.headers.get("webhook-signature", "")
+    if not webhook_id or not webhook_ts or not signature_header:
+        raise HTTPException(401, "Missing Dodo webhook signature headers")
+    try:
+        ts_int = int(webhook_ts)
+        if abs(time.time() - ts_int) > 300:
+            raise HTTPException(401, "Expired webhook")
+    except ValueError:
+        raise HTTPException(401, "Invalid webhook timestamp")
+
+    signed = f"{webhook_id}.{webhook_ts}.".encode() + payload
+    expected = hmac.new(secret.encode(), signed, hashlib.sha256).digest()
+    import base64
+    expected_b64 = base64.b64encode(expected).decode()
+    candidates = [part.strip() for part in signature_header.split(" ")]
+    # Standard Webhooks commonly prefixes signatures with v1, but accept bare base64 too.
+    valid = any(hmac.compare_digest(c.removeprefix("v1,"), expected_b64) for c in candidates)
+    if not valid:
+        raise HTTPException(401, "Invalid Dodo webhook signature")
+
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid webhook JSON")
+
+    # Idempotency on webhook-id.
+    if await db.payment_webhook_events.find_one({"webhook_id": webhook_id}):
+        return {"ok": True, "duplicate": True}
+    await db.payment_webhook_events.insert_one({"webhook_id": webhook_id, "received_at": now_utc().isoformat()})
+
+    event_type = event.get("type", "")
+    data = event.get("data") or {}
+    session_id = data.get("checkout_session_id") or data.get("session_id") or data.get("payment_id")
+    status_value = {
+        "payment.succeeded": "paid",
+        "payment.failed": "failed",
+        "payment.cancelled": "failed",
+        "payment.processing": "processing",
+        "subscription.active": "paid",
+        "subscription.failed": "failed",
+        "subscription.cancelled": "failed",
+    }.get(event_type)
+    if session_id and status_value:
+        await db.payment_transactions.update_one(
+            {"session_id": session_id, "provider": "dodo"},
+            {"$set": {
+                "payment_status": status_value,
+                "status": status_value,
+                "webhook_event_id": webhook_id,
+                "amount_total": data.get("total_amount") or data.get("amount") or 0,
+                "currency": (data.get("currency") or "usd").lower(),
+                "updated_at": now_utc().isoformat(),
+            }},
+        )
+    audit_log("dodo.webhook", event_type=event_type, session_id=session_id,
+              payment_status=status_value, webhook_id=webhook_id)
+    return {"ok": True}
+
+
+# ------------------------ Breeth memory ------------------------
+BREETH_BASE_URL = os.environ.get("BREETH_BASE_URL", "https://api.thebreeth.com/v1").rstrip("/")
+
+class MemoryWriteIn(BaseModel):
+    content: str = Field(min_length=1, max_length=12000)
+    group_id: Optional[str] = Field(default=None, max_length=120)
+    extract_intent: bool = True
+
+class MemorySearchIn(BaseModel):
+    query: str = Field(min_length=1, max_length=2000)
+    group_id: Optional[str] = Field(default=None, max_length=120)
+    limit: int = Field(default=10, ge=1, le=100)
+
+
+def _breeth_key() -> str:
+    key = os.environ.get("BREETH_API_KEY", "")
+    if not key:
+        raise HTTPException(503, "Breeth memory is not configured — set BREETH_API_KEY.")
+    return key
+
+
+def _breeth_group(group_id: Optional[str], user: dict) -> str:
+    # Always namespace Breeth memory by the authenticated organization.
+    # A caller-supplied group can refine scope but can never escape its tenant.
+    org_id = str(user.get("org_id") or "default")
+    local_group = group_id or "default"
+    return f"{org_id}:{local_group}"
+
+
+async def _breeth_request(method: str, path: str, *, json_body: Optional[dict] = None) -> dict:
+    headers = {"Authorization": f"Bearer {_breeth_key()}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        r = await http.request(method, f"{BREETH_BASE_URL}{path}", headers=headers, json=json_body)
+    if r.status_code >= 400:
+        logger.warning("Breeth request failed: %s %s", r.status_code, r.text[:500])
+        raise HTTPException(502, "Breeth memory service returned an error")
+    return r.json()
+
+
+@api.post("/memory/write", tags=["public"], summary="Write governed agent memory to Breeth")
+async def memory_write(body: MemoryWriteIn, request: Request):
+    user = await get_current_user(request)
+    group = _breeth_group(body.group_id, user)
+    result = await _breeth_request("POST", "/episodes", json_body={
+        "content": body.content,
+        "group_id": group,
+        "extract_intent": body.extract_intent,
+    })
+    audit_log("memory.write", provider="breeth", org_id=user.get("org_id"), group_id=group)
+    return {"provider": "breeth", "group_id": group, "result": result}
+
+
+@api.post("/memory/search", tags=["public"], summary="Search governed agent memory in Breeth")
+async def memory_search(body: MemorySearchIn, request: Request):
+    user = await get_current_user(request)
+    group = _breeth_group(body.group_id, user)
+    result = await _breeth_request("POST", "/search", json_body={
+        "query": body.query,
+        "group_id": group,
+        "limit": body.limit,
+    })
+    audit_log("memory.search", provider="breeth", org_id=user.get("org_id"), group_id=group)
+    return {"provider": "breeth", "group_id": group, "result": result}
+
+# ------------------------ health ------------------------
+@api.get("/")
+async def root():
+    return {"ok": True, "service": "RuntimeOS Runtime Governance"}
+
+
+# ------------------------ startup ------------------------
+async def _ensure_indexes():
+    await db.users.create_index("email", unique=True)
+    await db.users.create_index("id", unique=True)
+    await db.orgs.create_index("id", unique=True)
+    await db.agents.create_index([("org_id", 1), ("created_at", -1)])
+    await db.policies.create_index([("org_id", 1), ("priority", 1)])
+    await db.policy_versions.create_index([("policy_id", 1), ("version", -1)])
+    await db.decisions.create_index([("org_id", 1), ("created_at", -1)])
+    await db.escalations.create_index([("org_id", 1), ("status", 1)])
+    await db.api_keys.create_index([("org_id", 1), ("revoked", 1)])
+    await db.webhooks.create_index([("org_id", 1)])
+    await db.connectors.create_index([("org_id", 1)])
+    await db.risk_audit_events.create_index("sequence", unique=True)
+
+
+async def _seed_demo():
+    admin_email = os.environ.get("ADMIN_EMAIL", "admin@sentinel.ai").lower()
+    admin_pw = os.environ.get("ADMIN_PASSWORD", "REPLACE_WITH_LOCAL_ADMIN_PASSWORD")
+    org_name = os.environ.get("ADMIN_ORG_NAME", "Sentinel Labs")
+
+    existing = await db.users.find_one({"email": admin_email})
+    if existing:
+        # Keep password in sync if changed
+        if not verify_password(admin_pw, existing["password_hash"]):
+            await db.users.update_one({"email": admin_email},
+                                      {"$set": {"password_hash": hash_password(admin_pw)}})
+        org_id = existing["org_id"]
+    else:
+        org_id = new_id()
+        user_id = new_id()
+        await db.orgs.insert_one({
+            "id": org_id, "name": org_name, "owner_user_id": user_id,
+            "api_key": "sk_gov_" + uuid.uuid4().hex,
+            "created_at": now_utc().isoformat(),
+        })
+        await db.users.insert_one({
+            "id": user_id, "org_id": org_id, "email": admin_email, "name": "Admin",
+            "role": "owner", "password_hash": hash_password(admin_pw),
+            "created_at": now_utc().isoformat(),
+        })
+
+    # Only seed sample data if the org has none.
+    if await db.agents.count_documents({"org_id": org_id}) > 0:
+        return
+
+    sample_agents = [
+        {"name": "SupportBot", "framework": "openai", "description": "Answers customer support tickets",
+         "capabilities": ["read_tickets", "email"], "trust_level": "medium"},
+        {"name": "SalesInsights", "framework": "langchain", "description": "Analyzes CRM data for reps",
+         "capabilities": ["read_crm", "analytics"], "trust_level": "high"},
+        {"name": "DevOpsCopilot", "framework": "anthropic", "description": "Runs deploys and reads logs",
+         "capabilities": ["exec_shell", "deploy"], "trust_level": "low"},
+        {"name": "FinanceAssist", "framework": "custom", "description": "Handles invoices and reconciliation",
+         "capabilities": ["read_billing", "write_ledger"], "trust_level": "medium"},
+    ]
+    for a in sample_agents:
+        doc = {**a, "id": new_id(), "org_id": org_id, "status": "active",
+               "risk_score": {"low": 15, "medium": 45, "high": 75}[a["trust_level"]],
+               "decisions_count": 0, "created_at": now_utc().isoformat()}
+        await db.agents.insert_one(doc)
+
+    sample_policies = [
+        {"name": "Block deletions on production",
+         "description": "No agent may delete production resources.",
+         "priority": 10, "subject": "*", "resource_pattern": "prod.*",
+         "action": "delete", "conditions": [], "effect": "block", "enabled": True},
+        {"name": "Redact PII on customer reads",
+         "description": "Strip PII on customer data reads.",
+         "priority": 20, "subject": "*", "resource_pattern": "customers.*",
+         "action": "read", "conditions": [], "effect": "modify",
+         "modify_instructions": "Redact email, phone, SSN", "enabled": True},
+        {"name": "Escalate high-risk writes",
+         "description": "Any write with risk score >= 60 must be human-approved.",
+         "priority": 30, "subject": "*", "resource_pattern": "*",
+         "action": "write",
+         "conditions": [{"field": "risk_score", "op": "gt", "value": 60}],
+         "effect": "escalate", "enabled": True},
+        {"name": "Allow public docs",
+         "description": "All agents may read public docs.",
+         "priority": 40, "subject": "*", "resource_pattern": "docs.public.*",
+         "action": "read", "conditions": [], "effect": "allow", "enabled": True},
+        {"name": "Block low-trust agents from billing",
+         "description": "Low-trust agents cannot touch billing.",
+         "priority": 15, "subject": "*", "resource_pattern": "billing.*",
+         "action": "*",
+         "conditions": [{"field": "agent_trust", "op": "equals", "value": "low"}],
+         "effect": "block", "enabled": True},
+    ]
+    for p in sample_policies:
+        doc = {**p, "id": new_id(), "org_id": org_id, "hits": 0,
+               "created_at": now_utc().isoformat()}
+        await db.policies.insert_one(doc)
+
+
+@app.on_event("startup")
+async def _startup():
+    await _ensure_indexes()
+    await _seed_demo()
+    logger.info("AI Runtime Governance API ready.")
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    client.close()
+
+
+
+
+# ------------------------ Risk, Fraud & Regulatory Copilot ------------------------
+class RiskGovernanceIn(BaseModel):
+    action: str
+    resource: str
+    purpose: str = "hackathon"
+    amount_inr: float = Field(default=0, ge=0)
+    contains_pii: bool = False
+    external: bool = False
+    governance_level: Literal["OFF", "LOW", "MEDIUM", "HIGH"] = "LOW"
+    agent_trust: Literal["low", "medium", "high"] = "medium"
+    user_role: str = "analyst"
+    customer_owned_records: bool = True
+    provenance_ok: bool = True
+    tool_allowlisted: bool = True
+    tool_metadata_hash: str = "pinned"
+    delegation_scope: Optional[float] = Field(default=None, ge=0)
+    velocity: int = Field(default=1, ge=1, le=1000)
+    override_parameter: bool = False
+    uncertainty: float = Field(default=0, ge=0, le=1)
+    new_beneficiary: bool = False
+    documents_complete: bool = True
+
+
+@api.get("/risk/summary", tags=["risk"], summary="Risk/fraud overview for the Snowflake hackathon copilot")
+async def risk_summary_endpoint():
+    if not copilot_risk_summary:
+        raise HTTPException(503, "Risk copilot module unavailable")
+    return copilot_risk_summary()
+
+
+@api.get("/risk/transactions", tags=["risk"], summary="List high-risk synthetic transactions")
+async def risk_transactions_endpoint(min_risk: int = Query(60, ge=0, le=99), limit: int = Query(20, ge=1, le=100)):
+    if not copilot_list_transactions:
+        raise HTTPException(503, "Risk copilot module unavailable")
+    return {"transactions": copilot_list_transactions(min_risk=min_risk, limit=limit)}
+
+
+@api.get("/risk/transactions/{transaction_id}", tags=["risk"], summary="Investigate one synthetic transaction")
+async def risk_transaction_endpoint(transaction_id: str):
+    if not copilot_transaction_detail:
+        raise HTTPException(503, "Risk copilot module unavailable")
+    row = copilot_transaction_detail(transaction_id)
+    if not row:
+        raise HTTPException(404, "Transaction not found")
+    return row
+
+
+@api.post("/risk/copilot/query", tags=["risk"], summary="Natural-language risk/regulatory copilot query")
+async def risk_copilot_query_endpoint(body: Dict[str, Any]):
+    if not copilot_nl_query:
+        raise HTTPException(503, "Risk copilot module unavailable")
+    result = copilot_nl_query(str(body.get("query", "")))
+    await firestore_store.record("copilot_queries", {
+        "query": result.get("query") or str(body.get("query", "")),
+        "type": result.get("type"),
+        "answer": result.get("answer"),
+        "ai_provider": result.get("ai_provider"),
+    })
+    return result
+
+
+@api.post("/risk/govern", tags=["risk", "evaluate"], summary="Govern a BFSI risk-intelligence action with RuntimeOS")
+async def risk_govern_endpoint(body: RiskGovernanceIn):
+    if not copilot_governed_action:
+        raise HTTPException(503, "Risk copilot module unavailable")
+    result = copilot_governed_action(**body.model_dump(exclude={"purpose"}))
+    result["agent_id"] = "risk-intelligence-agent"
+    result["purpose"] = body.purpose
+    decision_id = new_id()
+
+    # Append-only hash chain for the competition audit trail. Raw payloads are
+    # never stored here; only governance-relevant evidence is persisted.
+    previous = await db.risk_audit_events.find_one({}, {"_id": 0, "event_hash": 1, "sequence": 1}, sort=[("sequence", -1)])
+    sequence = int((previous or {}).get("sequence", 0)) + 1
+    previous_hash = (previous or {}).get("event_hash", "GENESIS")
+    evidence = {
+        "decision_id": decision_id,
+        "agent_id": "risk-intelligence-agent",
+        "action": body.action,
+        "resource": body.resource,
+        "purpose": body.purpose,
+        "governance_level": result.get("governance_level"),
+        "risk_score": result.get("risk_score"),
+        "harm_probability": result.get("harm_probability"),
+        "decision": result.get("decision"),
+        "policy": result.get("matched_policy", {}).get("name") if result.get("matched_policy") else None,
+        "provenance": result.get("provenance"),
+        "timestamp": now_utc().isoformat(),
+    }
+    canonical = json.dumps({"previous_hash": previous_hash, "sequence": sequence, **evidence}, sort_keys=True, separators=(",", ":"), default=str)
+    event_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    await db.risk_audit_events.insert_one({"sequence": sequence, "previous_hash": previous_hash, "event_hash": event_hash, **evidence})
+    result["decision_id"] = decision_id
+    result["audit_event"] = {**evidence, "sequence": sequence, "event_hash": event_hash, "previous_hash": previous_hash}
+    await firestore_store.record("governance_decisions", {**evidence, "sequence": sequence, "event_hash": event_hash})
+    return result
+
+
+@api.get("/risk/firestore/recent", tags=["risk", "compliance"], summary="Recent copilot queries and decisions stored in Firestore")
+async def risk_firestore_recent_endpoint(limit: int = Query(20, ge=1, le=100)):
+    return {
+        "firestore_enabled": firestore_store.enabled(),
+        "copilot_queries": await firestore_store.recent("copilot_queries", limit),
+        "governance_decisions": await firestore_store.recent("governance_decisions", limit),
+    }
+
+
+@api.get("/risk/audit-chain", tags=["risk", "compliance"], summary="Verify append-only governance audit chain")
+async def risk_audit_chain_endpoint(limit: int = Query(100, ge=1, le=500)):
+    events = await db.risk_audit_events.find({}, {"_id": 0}).sort("sequence", 1).limit(limit).to_list(limit)
+    valid = True
+    previous_hash = "GENESIS"
+    for event in events:
+        payload = {k: event[k] for k in event if k not in {"event_hash", "previous_hash", "_id"}}
+        canonical = json.dumps({"previous_hash": previous_hash, **payload}, sort_keys=True, separators=(",", ":"), default=str)
+        expected = hashlib.sha256(canonical.encode()).hexdigest()
+        if event.get("previous_hash") != previous_hash or event.get("event_hash") != expected:
+            valid = False
+            break
+        previous_hash = event["event_hash"]
+    return {"valid": valid, "events_checked": len(events), "latest_hash": previous_hash if events else "GENESIS"}
+
+
+@api.get("/risk/governance-levels", tags=["risk"], summary="Describe Off/Low/Medium/High governance levels")
+async def risk_governance_levels_endpoint():
+    from risk_copilot import GOVERNANCE_LEVELS
+    return {"levels": [
+        {"level": "OFF", "purpose": "Baseline with no runtime gate"},
+        {"level": "LOW", "purpose": "Named action controls, PII redaction, escalation"},
+        {"level": "MEDIUM", "purpose": "Delegation, amount/velocity constraints, step-up and dual control"},
+        {"level": "HIGH", "purpose": "Harm probability, provenance, tool metadata pinning, uncertainty-aware escalation"},
+    ]}
+
+
+@api.get("/risk/scenarios", tags=["risk"], summary="Curated BFSI attack scenarios")
+async def risk_scenarios_endpoint():
+    if not copilot_nl_query:
+        raise HTTPException(503, "Risk copilot module unavailable")
+    from risk_copilot import benchmark_scenarios
+    return {"scenarios": benchmark_scenarios()}
+
+
+@api.get("/risk/scenarios/{scenario_id}/run", tags=["risk"], summary="Replay one curated scenario at a governance level")
+async def risk_scenario_run_endpoint(scenario_id: str, level: Literal["OFF", "LOW", "MEDIUM", "HIGH"] = "HIGH"):
+    from risk_copilot import scenario_result
+    try:
+        return scenario_result(scenario_id, level)
+    except KeyError:
+        raise HTTPException(404, "Scenario not found")
+
+
+@api.get("/risk/metrics", tags=["risk", "analytics"], summary="Governance level comparison metrics")
+async def risk_metrics_endpoint():
+    from risk_copilot import governance_metrics
+    return governance_metrics()
+
+
+@api.get("/risk/audit-report", tags=["risk", "compliance"], summary="Generate an audit-ready risk snapshot")
+async def risk_audit_report_endpoint():
+    if not copilot_audit_report:
+        raise HTTPException(503, "Risk copilot module unavailable")
+    return copilot_audit_report()
+
+
+app.include_router(api)
+
+# ============================================================
+# Security middleware stack (executed in reverse-registration order):
+#   1) CORS               — first-line origin control
+#   2) Security headers   — added to every response
+#   3) Origin CSRF check  — reject cross-origin mutations in prod
+#   4) Rate limiter       — per-IP sliding window per route class
+# ============================================================
+
+# ---- 1) CORS ----
+if IS_DEV:
+    # Permissive during local dev only.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=".*",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    if not ALLOWED_ORIGINS and not ALLOWED_ORIGIN_SUFFIXES:
+        logger.warning(
+            "ALLOWED_ORIGINS/ALLOWED_ORIGIN_SUFFIXES are empty in non-dev env; falling back to permissive CORS for browser demos"
+        )
+        _regex = ".*"
+    else:
+        _regex = _cors_regex()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=_regex or r"^$",
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+        max_age=600,
+    )
+
+
+# ---- 2) Security headers ----
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    )
+    if not IS_DEV:
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    return response
+
+
+# ---- 3) Origin-based CSRF guard for cookie-authenticated mutations ----
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+# Paths exempted from the Origin-based CSRF check. These are either:
+#   - session-establishing (no existing session to CSRF against), or
+#   - public forms deliberately reachable from any origin (marketing site,
+#     3rd-party embeds, Dodo Payments redirect, etc.)
+# Cookies still enforce SameSite=Strict + Secure elsewhere.
+#
+# NOTE: In development (ENVIRONMENT=development) the whole guard is bypassed.
+# NEVER set ENVIRONMENT=development in preview or production.
+_CSRF_EXEMPT_EXACT = {
+    "/api/auth/login",
+    "/api/auth/register",
+    "/api/auth/logout",
+    "/api/leads",
+}
+_CSRF_EXEMPT_PREFIXES = (
+    "/api/public/",
+    "/api/payments/checkout",
+    "/api/payments/status/",
+    "/api/webhook/",
+)
+
+
+def _csrf_exempt(path: str) -> bool:
+    if path in _CSRF_EXEMPT_EXACT:
+        return True
+    return any(path.startswith(p) for p in _CSRF_EXEMPT_PREFIXES)
+
+
+@app.middleware("http")
+async def _csrf_guard(request: Request, call_next):
+    # Only guard /api mutations. Same-origin browser POSTs always include an Origin
+    # header; SDK / server-to-server callers use Authorization: Bearer (not cookies)
+    # and are exempt because a cross-site attacker cannot forge that header.
+    if (
+        not IS_DEV
+        and request.method in _MUTATING_METHODS
+        and request.url.path.startswith("/api/")
+        and not _csrf_exempt(request.url.path)
+    ):
+        origin = request.headers.get("origin")
+        auth = request.headers.get("authorization", "")
+        if origin and not _origin_allowed(origin) and not auth.startswith("Bearer "):
+            audit_log(
+                "csrf.blocked",
+                origin=origin,
+                path=request.url.path,
+                ip=_client_ip(request),
+            )
+            return JSONResponse({"detail": "Origin not allowed"}, status_code=403)
+    return await call_next(request)
+
+
+# ---- 4) Rate limiter (in-process sliding window) ----
+# window_seconds, max_requests
+_RATE_RULES = [
+    ("/api/auth/",   (60, 20)),
+    ("/api/evaluate", (60, 6000)),   # 100 req/s per IP — hot path
+    ("/api/simulate", (60, 10)),
+    ("/api/public/",  (60, 15)),
+]
+_RATE_DEFAULT = (60, 240)
+_rate_state: Dict[str, deque] = {}
+
+
+def _rate_bucket(path: str):
+    for prefix, cfg in _RATE_RULES:
+        if path.startswith(prefix):
+            return prefix, cfg
+    return "default", _RATE_DEFAULT
+
+
+@app.middleware("http")
+async def _rate_limit(request: Request, call_next):
+    path = request.url.path
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    bucket, (window, limit) = _rate_bucket(path)
+    key = f"{bucket}:{_client_ip(request)}"
+    now = time.time()
+    q = _rate_state.setdefault(key, deque())
+    while q and now - q[0] > window:
+        q.popleft()
+    if len(q) >= limit:
+        audit_log("ratelimit.blocked", bucket=bucket, ip=_client_ip(request), path=path)
+        return JSONResponse(
+            {"detail": "Too many requests"},
+            status_code=429,
+            headers={"Retry-After": str(window)},
+        )
+    q.append(now)
+    return await call_next(request)

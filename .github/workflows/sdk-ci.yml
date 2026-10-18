@@ -1,0 +1,41 @@
+name: SDK CI
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "sdks/typescript/**"
+      - ".github/workflows/sdk-ci.yml"
+  pull_request:
+    paths:
+      - "sdks/typescript/**"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/typescript
+    strategy:
+      matrix:
+        node: ["18", "20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: "yarn"
+          cache-dependency-path: sdks/typescript/yarn.lock
+      - run: yarn install --frozen-lockfile
+      - run: yarn typecheck
+      - run: yarn test:examples
+      - run: yarn test
+      - run: yarn build
+      - name: Verify installable tarball
+        run: |
+          npm pack
+          TARBALL=$(ls memoryos-sdk-*.tgz)
+          mkdir -p /tmp/install-verify && cd /tmp/install-verify
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/sdks/typescript/$TARBALL" --silent
+          node -e "const m=require('memoryos-sdk'); if (typeof m.MemoryGate!=='function'||typeof m.MemoryOS!=='function') { process.exit(1); }"

@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "memoryos-sdk": ["./src/index.ts"],
+      "memoryos-sdk/middleware/langgraph": ["./src/middleware/langgraph.ts"],
+      "memoryos-sdk/middleware/openai-agents": ["./src/middleware/openai-agents.ts"],
+      "memoryos-sdk/middleware/crewai": ["./src/middleware/crewai.ts"],
+      "memoryos-sdk/middleware/google-adk": ["./src/middleware/google-adk.ts"],
+      "memoryos-sdk/middleware/mcp": ["./src/middleware/mcp.ts"]
+    }
+  },
+  "include": ["examples/**/*.ts"]
+}

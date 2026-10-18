@@ -1,0 +1,29 @@
+# Netlify config for this monorepo — the deployable app lives in frontend/,
+# not the repo root, so `base` tells Netlify where to run the build from.
+#
+# If you're setting this up via the Netlify UI instead of this file, the
+# equivalent manual settings are:
+#   Base directory:    frontend
+#   Build command:     yarn build
+#   Publish directory: frontend/build
+
+[build]
+  base = "frontend"
+  command = "yarn build"
+  publish = "build"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# The actual fix for "followed a broken link" on any route other than /:
+# this is a single-page app — react-router handles /console, /pricing,
+# /docs, etc. entirely client-side, so there's no console.html or
+# pricing.html file for Netlify to find. Without this rule, Netlify serves
+# its 404 page for any direct navigation, bookmark, or refresh on those
+# routes. This tells it to always serve index.html instead and let
+# react-router take it from there. (frontend/public/_redirects has the
+# same rule as a second, CRA-native way to express it — belt and braces.)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

@@ -1,0 +1,72 @@
+name: Publish memoryos-sdk to npm
+
+# Runs when a tag matching v* is pushed (e.g. v0.4.0, v0.4.1, v1.0.0),
+# OR when manually dispatched from the Actions tab.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (must already be committed in package.json)"
+        required: false
+
+jobs:
+  publish:
+    name: Build & publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for npm provenance
+    defaults:
+      run:
+        working-directory: sdks/typescript
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org/"
+          cache: "yarn"
+          cache-dependency-path: sdks/typescript/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Typecheck
+        run: yarn typecheck
+
+      - name: Typecheck examples
+        run: yarn test:examples
+
+      - name: Run tests
+        run: yarn test
+
+      - name: Build
+        run: yarn build
+
+      - name: Verify package name & version match the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p 'require("./package.json").version')"
+          PKG_NAME="$(node -p 'require("./package.json").name')"
+          echo "tag=$TAG_VERSION pkg=$PKG_NAME@$PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Git tag v$TAG_VERSION does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+          if [ "$PKG_NAME" != "memoryos-sdk" ]; then
+            echo "::error::Expected package name 'memoryos-sdk', got '$PKG_NAME'"
+            exit 1
+          fi
+
+      - name: Publish to npm (with provenance)
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

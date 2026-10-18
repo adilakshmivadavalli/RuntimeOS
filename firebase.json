@@ -1,0 +1,10 @@
+{
+  "hosting": {
+    "public": "frontend/build",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "rewrites": [
+      { "source": "/api/**", "run": { "serviceId": "runtimeos-api", "region": "asia-south1" } },
+      { "source": "**", "destination": "/index.html" }
+    ]
+  }
+}

@@ -1,0 +1,111 @@
+{
+  "name": "memoryos-sdk",
+  "version": "0.4.0",
+  "description": "Runtime governance for autonomous AI agents. Zero-trust decision layer with typed middleware for LangGraph, OpenAI Agents SDK, CrewAI, Google ADK, and MCP.",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./middleware/langgraph": {
+      "types": "./dist/middleware/langgraph.d.ts",
+      "import": "./dist/middleware/langgraph.js",
+      "require": "./dist/middleware/langgraph.cjs"
+    },
+    "./middleware/openai-agents": {
+      "types": "./dist/middleware/openai-agents.d.ts",
+      "import": "./dist/middleware/openai-agents.js",
+      "require": "./dist/middleware/openai-agents.cjs"
+    },
+    "./middleware/crewai": {
+      "types": "./dist/middleware/crewai.d.ts",
+      "import": "./dist/middleware/crewai.js",
+      "require": "./dist/middleware/crewai.cjs"
+    },
+    "./middleware/google-adk": {
+      "types": "./dist/middleware/google-adk.d.ts",
+      "import": "./dist/middleware/google-adk.js",
+      "require": "./dist/middleware/google-adk.cjs"
+    },
+    "./middleware/mcp": {
+      "types": "./dist/middleware/mcp.d.ts",
+      "import": "./dist/middleware/mcp.js",
+      "require": "./dist/middleware/mcp.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:examples": "tsc -p tsconfig.examples.json --noEmit",
+    "typecheck": "tsc --noEmit",
+    "verify": "yarn typecheck && yarn test && yarn test:examples && yarn build",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "ai",
+    "ai-agents",
+    "agent-governance",
+    "autonomous-agents",
+    "runtime-governance",
+    "policy-engine",
+    "zero-trust",
+    "security",
+    "compliance",
+    "audit",
+    "guardrails",
+    "langgraph",
+    "openai-agents",
+    "crewai",
+    "google-adk",
+    "mcp",
+    "model-context-protocol",
+    "enterprise-ai",
+    "typescript",
+    "sdk"
+  ],
+  "author": {
+    "name": "MemoryOS",
+    "url": "https://github.com/c0ntr1butr/MemoryOS"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/c0ntr1butr/MemoryOS#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/c0ntr1butr/MemoryOS.git",
+    "directory": "sdks/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/c0ntr1butr/MemoryOS/issues"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/c0ntr1butr"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.5.0"
+  }
+}
