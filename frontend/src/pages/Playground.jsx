@@ -501,7 +501,7 @@ export default function Playground() {
             Open console <ArrowRight size={14} />
           </Link>
           <a
-            href="mailto:praneethmangala339@gmail.com?subject=Enterprise%20pilot"
+            href="mailto:adilakshmi.vadavalli@gmail.com?subject=Enterprise%20pilot"
             className="btn-secondary flex items-center gap-2"
             data-testid="playground-book-pilot"
           >

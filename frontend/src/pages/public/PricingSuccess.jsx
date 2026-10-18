@@ -139,7 +139,7 @@ export default function PricingSuccess() {
               <Link to="/pricing" className="btn-primary flex items-center gap-2">
                 Back to pricing <ArrowRight size={14} />
               </Link>
-              <a href="mailto:praneethmangala339@gmail.com" className="btn-secondary flex items-center gap-2">
+              <a href="mailto:adilakshmi.vadavalli@gmail.com" className="btn-secondary flex items-center gap-2">
                 Contact us
               </a>
             </div>

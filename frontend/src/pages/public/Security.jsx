@@ -52,14 +52,11 @@ export default function Security() {
           security posture; the full whitepaper (PDF) is available on request.
         </p>
         <div className="mt-6 flex flex-wrap items-center gap-3">
-          <a href="mailto:praneethmangala339@gmail.com?subject=Whitepaper%20request" className="btn-primary flex items-center gap-2" data-testid="security-whitepaper-email">
+          <a href="mailto:adilakshmi.vadavalli@gmail.com?subject=Whitepaper%20request" className="btn-primary flex items-center gap-2" data-testid="security-whitepaper-email">
             <Download size={13} /> Request the whitepaper PDF
           </a>
-          <a href="mailto:praneethmangala339@gmail.com?subject=Security%20questionnaire" className="btn-secondary flex items-center gap-2" data-testid="security-questionnaire-email">
+          <a href="mailto:adilakshmi.vadavalli@gmail.com?subject=Security%20questionnaire" className="btn-secondary flex items-center gap-2" data-testid="security-questionnaire-email">
             Send security questionnaire
-          </a>
-          <a href="tel:+918328575111" className="btn-secondary flex items-center gap-2" data-testid="security-phone">
-            +91 83285 75111
           </a>
         </div>
       </section>
@@ -192,11 +189,8 @@ export default function Security() {
           penetration-testing report to share, email us. Median turnaround: 2 business days.
         </p>
         <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
-          <a href="mailto:praneethmangala339@gmail.com" className="btn-primary flex items-center gap-2" data-testid="security-contact-email">
-            <KeyRound size={13} /> praneethmangala339@gmail.com
-          </a>
-          <a href="tel:+918328575111" className="btn-secondary flex items-center gap-2" data-testid="security-contact-phone">
-            +91 83285 75111
+          <a href="mailto:adilakshmi.vadavalli@gmail.com" className="btn-primary flex items-center gap-2" data-testid="security-contact-email">
+            <KeyRound size={13} /> adilakshmi.vadavalli@gmail.com
           </a>
           <Link to="/pilot" className="btn-secondary flex items-center gap-2">
             Book a pilot <ArrowRight size={13} />

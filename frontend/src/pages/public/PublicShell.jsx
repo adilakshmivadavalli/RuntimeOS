@@ -290,25 +290,12 @@ export function PublicFooter() {
               Email
             </div>
             <a
-              href="mailto:praneethmangala339@gmail.com"
+              href="mailto:adilakshmi.vadavalli@gmail.com"
               data-testid="footer-contact-email"
-              title="praneethmangala339@gmail.com"
+              title="adilakshmi.vadavalli@gmail.com"
               className="font-mono-plex text-cyan-300 text-[15px] hover:underline decoration-cyan-500/40 underline-offset-4 block truncate max-w-full"
             >
-              praneethmangala339@gmail.com
-            </a>
-          </div>
-
-          <div className="min-w-0">
-            <div className="text-[11px] uppercase tracking-wider text-neutral-500 font-mono-plex mb-3">
-              Phone
-            </div>
-            <a
-              href="tel:+918328575111"
-              data-testid="footer-contact-phone"
-              className="font-mono-plex text-cyan-300 text-[15px] hover:underline decoration-cyan-500/40 underline-offset-4 whitespace-nowrap"
-            >
-              +91 83285 75111
+              adilakshmi.vadavalli@gmail.com
             </a>
           </div>
 
@@ -338,15 +325,11 @@ export function PublicFooter() {
           </div>
           <div className="text-neutral-600 text-xs font-mono-plex flex flex-wrap items-center gap-x-4 gap-y-2 max-w-full">
             <a
-              href="mailto:praneethmangala339@gmail.com"
+              href="mailto:adilakshmi.vadavalli@gmail.com"
               className="hover:text-cyan-300 transition-colors truncate max-w-[240px]"
-              title="praneethmangala339@gmail.com"
+              title="adilakshmi.vadavalli@gmail.com"
             >
-              praneethmangala339@gmail.com
-            </a>
-            <span>·</span>
-            <a href="tel:+918328575111" className="hover:text-cyan-300 transition-colors whitespace-nowrap">
-              +91 83285 75111
+              adilakshmi.vadavalli@gmail.com
             </a>
             <span>·</span>
             <a

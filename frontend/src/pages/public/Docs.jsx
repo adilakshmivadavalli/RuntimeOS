@@ -368,7 +368,7 @@ governed(agent, mg=mg, agent_id="agent_gemini_crm")`],
           </p>
           <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4 max-w-2xl">
             <a
-              href="mailto:praneethmangala339@gmail.com"
+              href="mailto:adilakshmi.vadavalli@gmail.com"
               className="surface rounded-xl p-5 hover:border-white/20 transition-colors"
               data-testid="docs-contact-email"
             >
@@ -376,19 +376,7 @@ governed(agent, mg=mg, agent_id="agent_gemini_crm")`],
                 Email
               </div>
               <div className="font-mono-plex text-cyan-300 text-[14px] mt-2 break-all">
-                praneethmangala339@gmail.com
-              </div>
-            </a>
-            <a
-              href="tel:+918328575111"
-              className="surface rounded-xl p-5 hover:border-white/20 transition-colors"
-              data-testid="docs-contact-phone"
-            >
-              <div className="text-[11px] uppercase tracking-wider text-neutral-500 font-mono-plex">
-                Phone
-              </div>
-              <div className="font-mono-plex text-cyan-300 text-[14px] mt-2">
-                +91 83285 75111
+                adilakshmi.vadavalli@gmail.com
               </div>
             </a>
           </div>

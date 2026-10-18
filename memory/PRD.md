@@ -19,7 +19,7 @@ User elaboration: framework-agnostic AI Runtime Governance Layer that sits betwe
 ### V6 — Public demo deployment prep (Feb 15, 2026)
 - **CORS/CSRF allowlist**: `.env` now sets `ALLOWED_ORIGINS` to include `http://localhost:3000/3001`, the preview host, and the deployed `ai-governance-layer.emergent.host`; `ALLOWED_ORIGIN_SUFFIXES` extended with `.emergent.host` and `.emergentagent.com` so any Emergent deployment subdomain works. No wildcard `*` in production — verified by `test_acao_is_never_wildcard`. Disallowed origins get 403 on mutations, GETs and Bearer/SDK callers stay exempt.
 - **GitHub rebrand**: every `https://github.com/memorygate` link now points to `https://github.com/c0ntr1butr/MemoryOS` — header, footer social row, Pricing "Community" CTA, and Playground header (data-testids: `public-header-github`, `playground-header-github`).
-- **Contact details** unified to Email `praneethmangala339@gmail.com` and Phone `+91 83285 75111`:
+- **Contact details** unified to Email `adilakshmi.vadavalli@gmail.com`:
   - Home: new `#contact` strip above the footer (`home-contact-email`, `home-contact-phone`).
   - Docs: new contact section at page bottom (`docs-contact-email`, `docs-contact-phone`).
   - Security: whitepaper/questionnaire CTAs + bottom contact block updated (`security-whitepaper-email`, `security-questionnaire-email`, `security-phone`, `security-contact-email`, `security-contact-phone`).
